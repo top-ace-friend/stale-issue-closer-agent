@@ -32,7 +32,7 @@ uv run -- pip install -U "langgraph-cli[inmem]"
 After this, start the LangGraph server (runs inside the uv-managed virtualenv):
 
 ```bash
-uv run -- langgraph dev
+uv run langgraph dev --allow-blocking
 ```
 
 This may take a second to start. Once the server is running, it should open a new browser tab to the LangGraph Studio through LangSmith. If this does not happen automatically, visit this URL:

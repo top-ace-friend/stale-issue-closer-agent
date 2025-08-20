@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
 
-import azure.identity.aio
+import azure.identity
 from dotenv import load_dotenv
 from langchain_core.messages import AIMessage
 from langchain_core.runnables import RunnableConfig
@@ -71,17 +71,27 @@ def _build_llm() -> Any:
         azure_endpoint = os.environ["AZURE_OPENAI_ENDPOINT"]
         azure_deployment = os.environ["AZURE_OPENAI_CHAT_DEPLOYMENT"]
         azure_version = os.getenv("AZURE_OPENAI_VERSION", "2024-02-15-preview")
-        azure_tenant_id = os.environ["AZURE_TENANT_ID"]
 
-        token_provider = azure.identity.aio.get_bearer_token_provider(
-            azure.identity.aio.AzureDeveloperCliCredential(tenant_id=azure_tenant_id),
+        # If an API key is provided, prefer it
+        api_key = os.getenv("AZURE_OPENAI_API_KEY")
+        if api_key:
+            return AzureChatOpenAI(
+                azure_endpoint=azure_endpoint,
+                azure_deployment=azure_deployment,
+                api_version=azure_version,
+                api_key=SecretStr(api_key),
+            )
+
+        # Otherwise, use Azure AD token provider via Azure Developer CLI credential
+        token_provider = azure.identity.get_bearer_token_provider(
+            azure.identity.AzureDeveloperCliCredential(tenant_id=os.getenv("AZURE_TENANT_ID")),
             "https://cognitiveservices.azure.com/.default",
         )
         return AzureChatOpenAI(
             azure_endpoint=azure_endpoint,
             azure_deployment=azure_deployment,
             api_version=azure_version,
-            azure_ad_async_token_provider=token_provider,
+            azure_ad_token_provider=token_provider,
         )
     # Configure the LLM via GitHub Models endpoint
     token = os.getenv("GITHUB_TOKEN")
