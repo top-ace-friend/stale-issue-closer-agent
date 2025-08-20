@@ -1,0 +1,59 @@
+
+[project]
+name = "agent-inbox-example"
+version = "0.0.1"
+description = "Example repository for getting started with the Agent Inbox"
+readme = "README.md"
+license = { file = "LICENSE" }
+authors = [{ name = "Brace Sproul" }]
+requires-python = ">=3.11,<4.0.0"
+dependencies = [
+    "langgraph>=0.6.5",
+    "python-dotenv>=1.0.1",
+    "langgraph-sdk>=0.2.2",
+    "langchain-openai>=0.3.30",
+    "langchain-mcp-adapters>=0.1.9",
+    "langgraph-cli[inmem]>=0.3.6",
+    "azure-identity>=1.24.0",
+]
+
+[dependency-groups]
+dev = [
+    "mypy>=1.11.1",
+    "ruff>=0.6.1",
+    "pytest>=8.3.4",
+]
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+lint.select = [
+    "E",    # pycodestyle
+    "F",    # pyflakes
+    "I",    # isort
+    "D",    # pydocstyle
+    "D401", # First line should be in imperative mood
+    "T201",
+    "UP",
+]
+lint.ignore = [
+    "UP006",
+    "UP007",
+    # We actually do want to import from typing_extensions
+    "UP035",
+    # Relax the convention by _not_ requiring documentation for every function parameter.
+    "D417",
+    "E501",
+]
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["D", "UP"]
+[tool.ruff.lint.pydocstyle]
+convention = "google"
