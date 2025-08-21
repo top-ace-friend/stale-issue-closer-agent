@@ -1,9 +1,9 @@
-"""LangGraph graph that uses the GitHub MCP server to propose closing stale issues.
+"""LangGraph graph that uses the GitHub GraphQL API to propose closing stale issues.
 
 With a human-in-the-loop review step using Agent Inbox-compatible interrupts.
 
 Environment variables used:
-- GITHUB_TOKEN: Required for MCP GitHub tools. Token with access to GitHub Models/MCP server.
+- GITHUB_TOKEN: Required for GitHub Models and the GitHub GraphQL API.
 - TARGET_REPO: Optional. Full repo (e.g. "owner/name").
 - Model selection:
     - API_HOST: "github" (default) or "azure".
@@ -13,21 +13,19 @@ Environment variables used:
 
 from __future__ import annotations
 
+import datetime as _dt
 import json
 import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, cast
+from typing import Any
 
 import azure.identity
 from dotenv import load_dotenv
 from langchain_core.messages import AIMessage
 from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import tool
-from langchain_mcp_adapters.client import (  # type: ignore[import-untyped]
-    MultiServerMCPClient,
-)
 from langchain_openai import AzureChatOpenAI, ChatOpenAI
 from langgraph.graph import StateGraph
 from langgraph.prebuilt import create_react_agent
@@ -39,6 +37,8 @@ from langgraph.prebuilt.interrupt import (
 )
 from langgraph.types import interrupt
 from pydantic import SecretStr
+
+from agent.github_client import GitHubClient
 
 # Load env vars from a .env file if present
 load_dotenv(override=True)
@@ -97,48 +97,13 @@ def _build_llm() -> Any:
     token = os.getenv("GITHUB_TOKEN")
     if not token:
         raise RuntimeError(
-            "GITHUB_TOKEN is required. Set it to a token that can access GitHub Models and the MCP GitHub server."
+            "GITHUB_TOKEN is required. Set it to a token that can access GitHub Models and GitHub GraphQL API."
         )
     return ChatOpenAI(
         model=os.getenv("GITHUB_MODEL", "gpt-4o"),
         base_url="https://models.inference.ai.azure.com",
         api_key=SecretStr(token),
     )
-
-
-async def _get_mcp_tools(allow: set[str] | None = None, require: bool = False) -> list[Any]:
-    """Fetch MCP tools from the GitHub server.
-
-    - allow: if provided, only return tools whose name is in this set.
-    - require: when True, raise if any tool in `allow` is missing.
-    """
-    token = os.getenv("GITHUB_TOKEN")
-    if not token:
-        raise RuntimeError(
-            "GITHUB_TOKEN is required. Set it to a token that can access GitHub Models and the MCP GitHub server."
-        )
-    client = MultiServerMCPClient(
-        {
-            "github": {
-                "url": "https://api.githubcopilot.com/mcp/",
-                "transport": "streamable_http",
-                "headers": {
-                    "Authorization": f"Bearer {token}",
-                },
-            }
-        }
-    )
-    all_tools = cast(list[Any], await client.get_tools())
-    if allow is None:
-        return all_tools
-
-    available_names = {
-        name for name in (getattr(t, "name", None) for t in all_tools) if isinstance(name, str)
-    }
-    missing = {n for n in allow if n not in available_names}
-    if require and missing:
-        raise RuntimeError(f"Missing required MCP tools: {sorted(missing)}")
-    return [t for t in all_tools if getattr(t, "name", None) in allow]
 
 
 @tool("ProposalResponse")
@@ -165,28 +130,125 @@ def ProposalResponse(
     }
     if suggested_comment is not None:
         payload["proposal"]["suggested_comment"] = suggested_comment
-    return json.dumps(payload)
+    return json.dumps(payload, ensure_ascii=False)
 
+
+@tool("search_issues")
+async def tool_search_issues(query: str) -> str:
+    """Search issues in the target repo.
+
+    Args:
+        query: Free-text and/or qualifiers. The repo qualifier is added automatically.
+
+    Returns:
+        JSON string containing a list of issue dicts with id, number, title, url, state,
+        updatedAt, createdAt, author, labels, body, and optionally comments.
+    """
+    client = GitHubClient()
+    items = await client.search_issues_with_bodies(
+        TARGET_REPO, query_text=query, max_results=5, include_comments=True
+    )
+    return json.dumps(items)
+
+
+@tool("search_code")
+async def tool_search_code(query: str) -> str:
+    """Search code in the target repo.
+
+    - Do NOT use boolean operators (AND, OR, NOT) in the query. The GitHub code search API does not support them.
+    - Use simple keyword or phrase queries only. For example:
+        - "form recognizer"
+        - "Document Intelligence"
+        - "documentanalysis"
+        - "DocumentAnalysisClient"
+    - If you want to search for multiple keywords, run separate queries for each keyword or phrase.
+
+    Args:
+        query: Free-text and/or qualifiers. The repo qualifier is added automatically.
+
+    Returns:
+        JSON string containing a list of code hit dicts with repository, path, is_binary, byte_size, and optionally text.
+    """
+    client = GitHubClient()
+    hits = await client.search_codebase(
+        TARGET_REPO, query_text=query, max_results=10, include_text=False
+    )
+    return json.dumps([h.__dict__ for h in hits])
+
+@tool("fetch_file")
+async def tool_fetch_file(filename_or_path: str) -> str:
+    """Fetch a file from the repository.
+
+    Args:
+        filename_or_path: The full or partial path to the file to fetch.
+
+    Returns:
+        JSON string containing the file contents or metadata.
+    """
+    client = GitHubClient()
+    item = await client.fetch_file(TARGET_REPO, filename_or_path, include_text=True)
+    return json.dumps(item.__dict__ if item else {})
 
 async def stale_issues_node(state: State, config: RunnableConfig) -> dict[str, Any]:
-    """Use the GitHub MCP server tools to find stale issues and propose closures.
-
-    Returns a dict that updates the state with a JSON string in `proposals_json`.
-    """
-    # Inline reader agent creation (read-only tools + ProposalResponse)
+    """Select the oldest stale issue, then let an agent investigate using tools."""
     model = _build_llm()
-    filtered_tools = await _get_mcp_tools(
-        allow={"search_issues", "get_issue", "search_code"}, require=True
+    # Agent with investigation tools + ProposalResponse for structured output
+    # Limit tool calls to 3 per tool to avoid recursion errors
+    agent = create_react_agent(
+        model,
+        [tool_search_issues, tool_search_code, tool_fetch_file, ProposalResponse]
     )
-    filtered_tools.append(ProposalResponse)
-    agent = create_react_agent(model, filtered_tools)
 
-    # Use preloaded template (read once at import time)
-    template = STALE_PROMPT_TEMPLATE
+    client = GitHubClient()
+    # Fetch a larger set and pick the oldest (least recently updated)
+    stale_issues = await client.find_stale_open_issues(TARGET_REPO)
+    if not stale_issues:
+        raise RuntimeError(f"No stale issues found in {TARGET_REPO}.")
 
-    prompt = template.replace("{{TARGET_REPO}}", TARGET_REPO)
+    #def _parse_ts(s: str) -> _dt.datetime:
+    #   # Normalize Z suffix to +00:00 for fromisoformat
+    #    return _dt.datetime.fromisoformat(s.replace("Z", "+00:00"))
 
-    # Invoke once; require ProposalResponse tool call and capture its args
+    #oldest = sorted(stale_issues, key=lambda it: _parse_ts(it.updated_at))[0]
+    oldest = stale_issues[0]
+    # Fetch full comments for the selected issue (all pages)
+    all_comments: list[dict[str, Any]] = await client.get_issue_comments(
+        TARGET_REPO, oldest.number
+    )
+
+    # Provide the issue context and instruct to use tools to investigate
+    prompt = (
+        "You are a helpful GitHub maintainer assistant.\n"
+        f"Repository: {TARGET_REPO}\n\n"
+        "Investigate whether the following stale issue is obsolete and can be closed.\n"
+        "You have the full issue details below (including all comments).\n"
+        "Use the available tools `search_issues` and `search_code` to look for related discussions and code changes.\n"
+        "Use the tool `fetch_file` to retrieve specific files if needed.\n"
+        "You may call each tool at most 3 times per issue investigation.\n"
+        "Then call the ProposalResponse tool exactly once with your decision.\n\n"
+        "Guidance:\n"
+        "- Prefer closing issues that lack reproduction details and seem environment-specific.\n"
+        "- Avoid closing issues with recent activity or clear ongoing work.\n"
+        "- Do NOT close an issue that has a comment posted after the 'stale' comment.\n"
+        "- If closure seems reasonable, draft an empathetic comment referencing relevant findings.\n"
+        "- If insufficient information, set can_close=false with rationale.\n\n"
+        "IMPORTANT: When using the `search_code` tool, do NOT use boolean operators (AND, OR, NOT) in your query.\n"
+        "Use simple keyword or phrase queries only. For example:\n"
+        "- 'form recognizer'\n"
+        "- 'Document Intelligence'\n"
+        "- 'documentanalysis'\n"
+        "- 'DocumentAnalysisClient'\n"
+        "If you want to search for multiple keywords, run separate queries for each keyword or phrase.\n\n"
+        "Issue details:\n"
+        f"- number: {oldest.number}\n"
+        f"- title: {oldest.title}\n"
+        f"- url: {oldest.url}\n"
+        f"- updatedAt: {oldest.updated_at}\n"
+        f"- labels: {', '.join(oldest.labels) if oldest.labels else '(none)'}\n"
+        f"- body:\n{(oldest.body[:4000])}\n"
+        f"- comments ({len(all_comments)} total):\n{json.dumps(all_comments, ensure_ascii=False)}\n"
+    )
+
     result = await agent.ainvoke({"messages": prompt})
     messages = result.get("messages") or []
 
@@ -310,34 +372,23 @@ async def finalize_node(state: State, config: RunnableConfig) -> dict[str, Any]:
 
 
 async def apply_decision_node(state: State, config: RunnableConfig) -> dict[str, Any]:
-    """If approved, post the comment and close the issue. Otherwise do nothing."""
+    """If approved, post the comment and close the issue via GraphQL. Otherwise do nothing."""
     assert state.proposal is not None and state.decision is not None
     issue = state.proposal
     decision = state.decision
-    number = issue.get("number")
+    number = int(issue.get("number"))
     approved = bool(decision.get("approved"))
-    comment = decision.get("comment") or ""
-
-    # Inline writer agent creation (write-only tools)
-    model = _build_llm()
-    filtered_tools = await _get_mcp_tools(
-        allow={"update_issue", "add_issue_comment"}, require=True
-    )
-    agent = create_react_agent(model, filtered_tools)
+    comment = (decision.get("comment") or "").strip()
 
     if not approved:
         return {}
 
-    instructions = (
-        f"For repo {TARGET_REPO}, for issue #{number}:\n"
-        "1) Post the following comment verbatim.\n"
-        "2) Close the issue.\n\n"
-        f"Comment:\n{comment}\n\n"
-        "Use only GitHub MCP tools to perform these actions. Then reply 'ok'."
+    client = GitHubClient()
+    # Ensure a non-empty comment; if empty, supply a generic one
+    close_comment = comment or (
+        "Closing as stale. If you're still affected, please open a new issue with updated details."
     )
-
-    async for _ in agent.astream_events({"messages": instructions}, version="v2"):
-        pass
+    await client.close_issue_with_comment(TARGET_REPO, number, close_comment)
     return {}
 
 

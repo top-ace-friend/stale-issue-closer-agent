@@ -1,84 +1,196 @@
-# Agent Inbox LangGraph Example
+# Issue Triager Agent
 
-The repository contains a bare minimum code example to get started with the Agent Inbox with LangGraph.
+[![Open in GitHub Codespaces](https://img.shields.io/static/v1?style=for-the-badge&label=GitHub+Codespaces&message=Open&color=brightgreen&logo=github)](https://codespaces.new/top-ace-friend/stale-issue-closer-agent)
+[![Open in Dev Containers](https://img.shields.io/static/v1?style=for-the-badge&label=Dev%20Containers&message=Open&color=blue&logo=visualstudiocode)](https://vscode.dev/redirect?url=vscode://ms-vscode-remote.remote-containers/cloneInVolume?url=https://github.com/top-ace-friend/stale-issue-closer-agent)
 
-> [!TIP]
-> Looking for the TypeScript version of this example repository? See the [TypeScript example repository](https://github.com/langchain-ai/agent-inbox-langgraphjs-example).
+This repository provides a LangGraph-based agent that proposes closing stale GitHub issues, with a human-in-the-loop review step using Agent Inbox. It selects stale issues from a target repository, investigates with repository-aware tools, and then interrupts for you to approve, edit, respond, or ignore before it posts a closing comment and closes the issue. The agent uses Azure OpenAI for the LLM.
 
-## Getting Started
+- Graph ID: `agent` (see `langgraph.json`)
+- Default target repo: `Azure-samples/azure-search-openai-demo` (configurable via `TARGET_REPO`)
 
-To get started, clone the repository:
+Contents
 
-```bash
-git clone https://github.com/langchain-ai/agent-inbox-langgraph-example.git
-```
+- Getting started
+  - GitHub Codespaces
+  - VS Code Dev Containers
+  - Local environment
+- GitHub authentication (required)
+- Configuring Azure AI models
+- Running the stale issue closer
+- Agent Inbox setup
+- Cost estimate
+- Developer tasks
+- Resources
 
-```bash
-cd agent-inbox-langgraph-example
-```
+## Getting started
 
-This project uses uv for dependency management. First, sync the environment (this will create a local `.venv` and `uv.lock`):
+You have a few options for getting set up. The quickest is GitHub Codespaces, but you can also use a Dev Container locally or your native environment.
 
-```bash
-uv sync
-```
+### GitHub Codespaces
 
-Next, install the [LangGraph CLI](https://langchain-ai.github.io/langgraph/cloud/reference/cli/). We use the in-memory version so we can run the LangGraph server without Docker. Install it into the project environment via uv:
+Run this repo virtually in your browser:
 
-```bash
-uv run -- pip install -U "langgraph-cli[inmem]"
-```
+1. Open the repository in Codespaces (it may take a few minutes to build):
 
-After this, start the LangGraph server (runs inside the uv-managed virtualenv):
+	[![Open in GitHub Codespaces](https://github.com/codespaces/badge.svg)](https://codespaces.new/top-ace-friend/stale-issue-closer-agent)
 
-```bash
-uv run langgraph dev --allow-blocking
-```
+2. Open a terminal in the Codespace.
+3. Continue with the steps in “Running the stale issue closer”.
 
-This may take a second to start. Once the server is running, it should open a new browser tab to the LangGraph Studio through LangSmith. If this does not happen automatically, visit this URL:
-[https://smith.langchain.com/studio/thread?baseUrl=http%3A%2F%2F127.0.0.1%3A2024](https://smith.langchain.com/studio/thread?baseUrl=http%3A%2F%2F127.0.0.1%3A2024)
+### VS Code Dev Containers
 
-Now that our LangGraph server is running, we can start a new run in the Studio. To do this, simply enter any string into the `Interrupt Response` field, then click the `Submit` button. This will execute the graph, and interrupt on the `human_node`. Once the graph has interrupted, we can visit the Agent Inbox site to add your graph, and manage the interrupted thread.
+Open the project in a local Dev Container using the Dev Containers extension:
 
-Tip: Common dev tasks are available via the Makefile and run through uv:
+1. Start Docker Desktop.
+2. Open the project in a Dev Container:
 
-- Run tests: `uv run -- python -m pytest`
-- Lint/format: `uv run -- ruff check .` and `uv run -- ruff format .`
-- Type checking: `uv run -- mypy src`
+	[![Open in Dev Containers](https://img.shields.io/static/v1?style=for-the-badge&label=Dev%20Containers&message=Open&color=blue&logo=visualstudiocode)](https://vscode.dev/redirect?url=vscode://ms-vscode-remote.remote-containers/cloneInVolume?url=https://github.com/top-ace-friend/stale-issue-closer-agent)
 
-## Agent Inbox Setup
+3. Once the container is ready, open a terminal.
+4. Continue with the steps in “Running the stale issue closer”.
 
-Visit [`dev.agentinbox.ai`](https://dev.agentinbox.ai). If it's your first time visiting the site, you'll be prompted to add a new graph.
+### Local environment
 
-Enter the following fields into the form:
+1. Make sure the following are installed:
 
-- Graph/Assistant ID: `agent` - this corresponds to the ID of the graph defined in the [`langgraph.json`](./langgraph.json) file, or the ID of an assistant tied to your graph.
-- Deployment URL: `http://127.0.0.1:2024` - this is the URL of the LangGraph server running locally.
-- Name: `My Agent` - this is the optional name of the graph. You can set this to any value you want, or leave it empty and it'll be auto-assigned.
+	- Python 3.11+
+	- Git
+	- [uv](https://docs.astral.sh/uv/) (for dependency management)
 
-Click `Submit` and watch your graph appear in the sidebar. This should automatically fetch the interrupted threads, but if it does not, click on the sidebar item & refresh the page. Once you've done this, you should see a single interrupted item in the table:
+2. Clone the repository:
 
-![Screenshot of the Agent Inbox](./static/agent_inbox_view.png)
+	```bash
+	git clone https://github.com/top-ace-friend/stale-issue-closer-agent
+	cd stale-issue-closer-agent
+	```
 
-Click on this row, and you'll be taken to the interrupted item page. From here, you can respond in any way you'd like:
+3. Create the virtual environment and install dependencies (this will create `.venv` and `uv.lock`):
 
-- Accept
-- Edit
-- Respond
-- Ignore
+	```bash
+	uv sync
+	```
 
-![Screenshot of an interrupted item in the Agent Inbox](./static/interrupted_item.png)
+## GitHub authentication (required)
 
-Once you take an action, the graph will resume the execution and end. The final state returned from the graph will be a string containing the type of action which was taken, and the value of the action args (unless `ignore` was chosen).
+This project requires a GitHub personal access token to call the GitHub GraphQL and REST APIs (for searching issues/code and closing issues). It does not use GitHub Models for the LLM.
 
-To view the result of the graph, go back to the LangGraph Studio and inspect the most recent thread results.
+- In GitHub Codespaces, `GITHUB_TOKEN` may already be available.
+- Locally or in Dev Containers, set it in your shell or in a local `.env` file:
 
-![Screenshot of the most recent thread results LangGraph Studio](./static/studio_thread_result.png)
+  ```bash
+  # Shell example (zsh)
+  export GITHUB_TOKEN=your_personal_access_token
+  ```
 
-## Go Deeper
+## Configuring Azure AI models
 
-If you'd like to go deeper, you can:
+Azure OpenAI is required for the LLM. This repository includes IaC (Bicep) to provision an Azure OpenAI deployment and writes a ready-to-use `.env` file.
 
-- Checkout the Agent Inbox docs, and codebase here: [github.com/langchain-ai/agent-inbox](https://github.com/langchain-ai/agent-inbox)
-- See an open source Executive AI Assistant here: [github.com/langchain-ai/executive-ai-assistant](https://github.com/langchain-ai/executive-ai-assistant)
-- See an open source Social Media Agent here: [github.com/langchain-ai/social-media-agent](https://github.com/langchain-ai/social-media-agent)
+1. Install the Azure Developer CLI (azd):
+
+	See the install guide: <https://aka.ms/install-azd>
+
+2. Sign in to Azure:
+
+	```bash
+	azd auth login
+	# If that fails (e.g., in Codespaces), try device code:
+	azd auth login --use-device-code
+	```
+
+3. Provision Azure resources (this deploys Azure OpenAI and writes `.env` via a post-provision hook):
+
+	```bash
+	azd provision
+	```
+
+	After provisioning, your `.env` will include values like:
+
+	- `API_HOST=azure`
+	- `AZURE_TENANT_ID`, `AZURE_OPENAI_ENDPOINT`, `AZURE_OPENAI_CHAT_DEPLOYMENT`, `AZURE_OPENAI_VERSION`, `AZURE_OPENAI_CHAT_MODEL`
+
+4. Cleanup when finished:
+
+	```bash
+	azd down
+	```
+
+Important:
+
+- You still need `GITHUB_TOKEN` for the GitHub GraphQL and REST APIs used by this project.
+
+## Running the stale issue closer
+
+This project uses `uv` and LangGraph’s dev server.
+
+1. Ensure dependencies are installed:
+
+	```bash
+	uv sync
+	```
+
+2. (Optional) Set the target repository and other environment variables:
+
+	```bash
+	# Full name, e.g., owner/name. Default is Azure-samples/azure-search-openai-demo
+	export TARGET_REPO=owner/name
+	# GitHub token is required in all modes
+	export GITHUB_TOKEN=your_personal_access_token
+	```
+
+3. Start the LangGraph dev server (runs inside the uv-managed virtualenv):
+
+	```bash
+	uvx --from "langgraph-cli[inmem]" --with-editable . langgraph dev --allow-blocking
+	```
+
+	When it’s running, a browser tab should open to LangGraph Studio via LangSmith. If it doesn’t, open this URL: <https://smith.langchain.com/studio/thread?baseUrl=http%3A%2F%2F127.0.0.1%3A2024>
+
+4. In LangGraph Studio, start a new run of the `agent` graph. The agent will select a stale issue from `TARGET_REPO`, investigate with tools, then interrupt for review.
+
+## Agent Inbox setup
+
+Use Agent Inbox to review and act on the interruption created by the graph.
+
+1. Visit <https://dev.agentinbox.ai>
+2. Add your graph with these fields:
+	- Graph/Assistant ID: `agent` (matches `langgraph.json`)
+	- Deployment URL: `http://127.0.0.1:2024`
+	- Name: any display name (optional)
+3. Open the `agent` entry from the sidebar and refresh if needed. You should see the interrupted item. Click it to review and choose an action:
+	- Accept: approve as-is
+	- Edit: update the suggested comment and/or can_close
+	- Respond: leave a note (no changes applied)
+	- Ignore: skip the issue
+
+After you accept or edit, the graph resumes and, if approved, posts a comment and closes the issue.
+
+## Cost estimate
+
+LLM usage varies per issue depending on the number of tool calls and the length of the issue and comments. With Azure OpenAI, cost depends on the model and tokens processed. See pricing: <https://azure.microsoft.com/pricing/details/cognitive-services/openai-service/>
+
+## Developer tasks
+
+Common dev tasks are available via `uv` and the included Makefile targets:
+
+- Run tests:
+  ```bash
+  uv run -- python -m pytest
+  ```
+- Lint / format:
+  ```bash
+  uv run -- ruff check .
+  uv run -- ruff format .
+  ```
+- Type checking:
+  ```bash
+  uv run -- mypy src
+  ```
+
+## Resources
+
+- Agent Inbox: <https://github.com/langchain-ai/agent-inbox>
+- LangGraph docs: <https://langchain-ai.github.io/langgraph/>
+- LangGraph Studio (via LangSmith): <https://smith.langchain.com/>
+- LangGraph Studio (via LangSmith): <https://smith.langchain.com/>
+
