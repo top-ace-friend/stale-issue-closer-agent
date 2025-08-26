@@ -13,7 +13,6 @@ Environment variables used:
 
 from __future__ import annotations
 
-import datetime as _dt
 import json
 import logging
 import os
@@ -23,10 +22,12 @@ from typing import Any
 
 import azure.identity
 from dotenv import load_dotenv
+from jinja2 import BaseLoader, Environment
 from langchain_core.messages import AIMessage
 from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import tool
 from langchain_openai import AzureChatOpenAI, ChatOpenAI
+from langgraph.errors import GraphRecursionError
 from langgraph.graph import StateGraph
 from langgraph.prebuilt import create_react_agent
 from langgraph.prebuilt.interrupt import (
@@ -36,7 +37,7 @@ from langgraph.prebuilt.interrupt import (
     HumanResponse,
 )
 from langgraph.types import interrupt
-from pydantic import SecretStr
+from pydantic import BaseModel, Field, SecretStr
 
 from agent.github_client import GitHubClient
 
@@ -45,22 +46,51 @@ load_dotenv(override=True)
 
 logger = logging.getLogger(__name__)
 
-# Preload the stale prompt template at import time (one-time blocking IO outside async paths)
-PROMPT_TEMPLATE_PATH = Path(__file__).with_name("staleprompt.md")
-try:
-    STALE_PROMPT_TEMPLATE = PROMPT_TEMPLATE_PATH.read_text(encoding="utf-8")
-except Exception as exc:  # noqa: BLE001
-    raise RuntimeError(
-        f"Failed to read prompt template at {PROMPT_TEMPLATE_PATH}: {exc}"
-    ) from exc
+# Jinja2 environment shared by all templates
+_jinja_env = Environment(loader=BaseLoader(), autoescape=False, trim_blocks=True, lstrip_blocks=True)
+
+# Review description template for human interrupt (required, Jinja2)
+REVIEW_TEMPLATE_PATH = Path(__file__).with_name("review_template.md.jinja2")
+REVIEW_TEMPLATE = REVIEW_TEMPLATE_PATH.read_text(encoding="utf-8")
+REVIEW_TEMPLATE_JINJA = _jinja_env.from_string(REVIEW_TEMPLATE)
+
+# Research phase prompt template (Jinja2)
+RESEARCH_PROMPT_TEMPLATE_PATH = Path(__file__).with_name("research_prompt.md.jinja2")
+RESEARCH_PROMPT_TEMPLATE = RESEARCH_PROMPT_TEMPLATE_PATH.read_text(encoding="utf-8")
+RESEARCH_PROMPT_TEMPLATE_JINJA = _jinja_env.from_string(RESEARCH_PROMPT_TEMPLATE)
+
+# Propose action system prompt template (Jinja2)
+PROPOSE_ACTION_PROMPT_TEMPLATE_PATH = Path(__file__).with_name("propose_action_prompt.md.jinja2")
+PROPOSE_ACTION_PROMPT_TEMPLATE = PROPOSE_ACTION_PROMPT_TEMPLATE_PATH.read_text(encoding="utf-8")
+PROPOSE_ACTION_PROMPT_TEMPLATE_JINJA = _jinja_env.from_string(PROPOSE_ACTION_PROMPT_TEMPLATE)
 
 @dataclass
 class State:
     """State for single-issue processing."""
 
+    issue: dict[str, Any] | None = None  # Selected issue details (number, title, body, etc.)
     proposal: dict[str, Any] | None = None  # Single proposal
     decision: dict[str, Any] | None = None  # Decision for this issue
     review_note: str | None = None  # Optional note from human review
+    research_summary: str | None = None  # Consolidated research notes from first agent
+
+
+class ProposalModel(BaseModel):
+    """Structured proposal produced after research phase."""
+    # Identity fields (number, title, url) are intentionally omitted to avoid duplication
+    # with State.issue. This model focuses solely on recommended maintenance actions.
+    close_issue: bool = Field(description="Whether the issue should be closed now")
+    close_issue_rationale: str | None = Field(default=None, description="Specific justification (evidence) for closing or leaving open; cite signals.")
+    remove_label_for_stale: bool = Field(description="Whether to remove the 'Stale' label (issue should remain open or has recent activity)")
+    remove_label_for_stale_rationale: str | None = Field(default=None, description="Why the stale label should be removed or kept.")
+    add_label_for_enhancement: bool = Field(description="Whether to add the 'enhancement' label")
+    add_label_for_enhancement_rationale: str | None = Field(default=None, description="Evidence that this is (or is not) an enhancement request.")
+    add_label_for_needs_more_info: bool = Field(description="Whether to add the 'needs more info' label (request clarification/details)")
+    add_label_for_needs_more_info_rationale: str | None = Field(default=None, description="Why additional info is required or not necessary.")
+    post_comment: str | None = Field(
+        default=None, description="Optional comment to post (explanatory or request for info)"
+    )
+    rationale: str = Field(description="Concise reasoning for the chosen actions")
 
 
 def _build_llm() -> Any:
@@ -104,33 +134,6 @@ def _build_llm() -> Any:
         base_url="https://models.inference.ai.azure.com",
         api_key=SecretStr(token),
     )
-
-
-@tool("ProposalResponse")
-def ProposalResponse(
-    number: int,
-    title: str,
-    url: str,
-    can_close: bool,
-    rationale: str,
-    suggested_comment: str | None = None,
-) -> str:
-    """Call this tool at the end to emit the final structured proposal.
-
-    Returns the proposal as a JSON string for downstream parsing.
-    """
-    payload = {
-        "proposal": {
-            "number": number,
-            "title": title,
-            "url": url,
-            "can_close": can_close,
-            "rationale": rationale,
-        },
-    }
-    if suggested_comment is not None:
-        payload["proposal"]["suggested_comment"] = suggested_comment
-    return json.dumps(payload, ensure_ascii=False)
 
 
 @tool("search_issues")
@@ -189,131 +192,181 @@ async def tool_fetch_file(filename_or_path: str) -> str:
     item = await client.fetch_file(TARGET_REPO, filename_or_path, include_text=True)
     return json.dumps(item.__dict__ if item else {})
 
-async def stale_issues_node(state: State, config: RunnableConfig) -> dict[str, Any]:
-    """Select the oldest stale issue, then let an agent investigate using tools."""
-    model = _build_llm()
-    # Agent with investigation tools + ProposalResponse for structured output
-    # Limit tool calls to 3 per tool to avoid recursion errors
-    agent = create_react_agent(
-        model,
-        [tool_search_issues, tool_search_code, tool_fetch_file, ProposalResponse]
-    )
+@tool("get_issue")
+async def tool_get_issue(issue_number: int) -> str:
+    """Fetch a single issue (and recent comments) by its number.
 
+    Args:
+        issue_number: The numeric issue identifier (e.g., 1536).
+
+    Returns:
+        JSON string with issue fields (id, number, title, url, state, updatedAt, createdAt, author, labels, body, comments[]).
+        Returns an empty JSON object if the issue is not found.
+    """
     client = GitHubClient()
-    # Fetch a larger set and pick the oldest (least recently updated)
+    issue = await client.get_issue(TARGET_REPO, issue_number, include_comments=True, comments_limit=50)
+    return json.dumps(issue or {})
+
+async def select_stale_issue_node(state: State, config: RunnableConfig) -> dict[str, Any]:
+    """Fetch stale issues and pick one (currently first in list) and its comments.
+
+    Returns partial state with `issue` containing the selected issue, plus embedded comments list.
+    """
+    client = GitHubClient()
     stale_issues = await client.find_stale_open_issues(TARGET_REPO)
     if not stale_issues:
         raise RuntimeError(f"No stale issues found in {TARGET_REPO}.")
+    selected = stale_issues[0]
+    comments = await client.get_issue_comments(TARGET_REPO, selected.number)
+    issue_dict: dict[str, Any] = {
+        "number": selected.number,
+        "title": selected.title,
+        "url": selected.url,
+        "updated_at": selected.updated_at,
+        "created_at": selected.created_at,
+        "author": selected.author,
+        "labels": selected.labels,
+        "body": selected.body,
+        "comments": comments,
+    }
+    return {"issue": issue_dict}
 
-    #def _parse_ts(s: str) -> _dt.datetime:
-    #   # Normalize Z suffix to +00:00 for fromisoformat
-    #    return _dt.datetime.fromisoformat(s.replace("Z", "+00:00"))
 
-    #oldest = sorted(stale_issues, key=lambda it: _parse_ts(it.updated_at))[0]
-    oldest = stale_issues[0]
-    # Fetch full comments for the selected issue (all pages)
-    all_comments: list[dict[str, Any]] = await client.get_issue_comments(
-        TARGET_REPO, oldest.number
+async def research_issue_node(state: State, config: RunnableConfig) -> dict[str, Any]:
+    """Investigate the selected issue using tools and produce a research summary (NOT the final proposal).
+
+    This node performs exploratory searches/code lookups and synthesizes findings into a plain text
+    research_summary that a second node will consume to decide on closure.
+    """
+    assert state.issue is not None, "Issue must be selected before research."
+    issue = state.issue
+    model = _build_llm()
+    research_tools = [tool_search_issues, tool_search_code, tool_fetch_file, tool_get_issue]
+    agent = create_react_agent(model, research_tools)
+    all_comments = issue.get("comments", [])
+    prompt = RESEARCH_PROMPT_TEMPLATE_JINJA.render(
+        repo=TARGET_REPO,
+        issue={
+            "number": issue["number"],
+            "title": issue["title"],
+            "url": issue["url"],
+            "updated_at": issue["updated_at"],
+            "labels": issue.get("labels") or [],
+            "body": issue.get("body") or "",
+            "comments": all_comments,
+        },
+        comments_json=json.dumps(all_comments, ensure_ascii=False),
     )
 
-    # Provide the issue context and instruct to use tools to investigate
-    prompt = (
-        "You are a helpful GitHub maintainer assistant.\n"
-        f"Repository: {TARGET_REPO}\n\n"
-        "Investigate whether the following stale issue is obsolete and can be closed.\n"
-        "You have the full issue details below (including all comments).\n"
-        "Use the available tools `search_issues` and `search_code` to look for related discussions and code changes.\n"
-        "Use the tool `fetch_file` to retrieve specific files if needed.\n"
-        "You may call each tool at most 3 times per issue investigation.\n"
-        "Then call the ProposalResponse tool exactly once with your decision.\n\n"
-        "Guidance:\n"
-        "- Prefer closing issues that lack reproduction details and seem environment-specific.\n"
-        "- Avoid closing issues with recent activity or clear ongoing work.\n"
-        "- Do NOT close an issue that has a comment posted after the 'stale' comment.\n"
-        "- If closure seems reasonable, draft an empathetic comment referencing relevant findings.\n"
-        "- If insufficient information, set can_close=false with rationale.\n\n"
-        "IMPORTANT: When using the `search_code` tool, do NOT use boolean operators (AND, OR, NOT) in your query.\n"
-        "Use simple keyword or phrase queries only. For example:\n"
-        "- 'form recognizer'\n"
-        "- 'Document Intelligence'\n"
-        "- 'documentanalysis'\n"
-        "- 'DocumentAnalysisClient'\n"
-        "If you want to search for multiple keywords, run separate queries for each keyword or phrase.\n\n"
-        "Issue details:\n"
-        f"- number: {oldest.number}\n"
-        f"- title: {oldest.title}\n"
-        f"- url: {oldest.url}\n"
-        f"- updatedAt: {oldest.updated_at}\n"
-        f"- labels: {', '.join(oldest.labels) if oldest.labels else '(none)'}\n"
-        f"- body:\n{(oldest.body[:4000])}\n"
-        f"- comments ({len(all_comments)} total):\n{json.dumps(all_comments, ensure_ascii=False)}\n"
-    )
+    # Allow caller or env to override recursion limit (default 20)
+    try:
+        rec_limit = int(os.getenv("RESEARCH_RECURSION_LIMIT", "20"))
+    except ValueError:
+        rec_limit = 20
+    # Merge provided config with our recursion limit (without mutating original)
+    merged_config: RunnableConfig = {**(config or {}), "configurable": {**getattr(config, "get", lambda _k, _d=None: {})("configurable", {}), "recursion_limit": rec_limit}}  # type: ignore[arg-type]
 
-    result = await agent.ainvoke({"messages": prompt})
+    try:
+        result = await agent.ainvoke({"messages": [("human", prompt)]}, config=merged_config)
+    except GraphRecursionError:
+        logger.warning("Research agent hit recursion limit (%s). Falling back to minimal summary.", rec_limit)
+        fallback = (
+            "Research phase exceeded recursion limit before converging. Proceeding with available static context.\n\n"
+            "Key Facts:\n"
+            f"Issue #{issue['number']}: {issue['title']}\n"
+            f"Labels: {', '.join(issue['labels']) if issue.get('labels') else '(none)'}\n"
+            f"Last Updated: {issue['updated_at']}\n\n"
+            "Signals Against Closing:\n- Agent could not complete research automatically.\n\n"
+            "Open Questions:\n- Additional related issues or code references were not gathered due to recursion limit.\n"
+        )
+        return {"research_summary": fallback}
+
     messages = result.get("messages") or []
-
-    # Find the last AIMessage and its ProposalResponse tool call
-    observed_tool_calls: list[str] = []
-    last_ai_text: str | None = None
+    # Find last AI message without tool calls (research summary)
     for m in reversed(messages):
-        if isinstance(m, AIMessage):
-            if isinstance(m.content, str):
-                last_ai_text = last_ai_text or m.content
-            for call in (m.tool_calls or []):
-                if call.get("name") == "ProposalResponse":
-                    args = call.get("args")
-                    if isinstance(args, dict):
-                        # normalize into single proposal dict
-                        return {"proposal": {
-                            "number": args.get("number"),
-                            "title": args.get("title"),
-                            "url": args.get("url"),
-                            "can_close": args.get("can_close"),
-                            "rationale": args.get("rationale"),
-                            "suggested_comment": args.get("suggested_comment"),
-                        }}
-                name = call.get("name")
-                if isinstance(name, str):
-                    observed_tool_calls.append(name)
-    # If we didn't find the tool call, fail fast (no fallbacks)
-    if observed_tool_calls:
-        logger.info("[stale_issues_node] Tool calls observed: %s", observed_tool_calls)
-    if last_ai_text:
-        snippet = (last_ai_text[:400] + "…") if len(last_ai_text) > 400 else last_ai_text
-        logger.info("[stale_issues_node] Last AI text: %s", snippet)
-    raise RuntimeError(
-        f"ProposalResponse tool was not called. Observed tool calls: {observed_tool_calls or 'none'}."
+        if isinstance(m, AIMessage) and not m.tool_calls and isinstance(m.content, str):
+            summary = m.content.strip()
+            if not summary:
+                continue
+            return {"research_summary": summary}
+    raise RuntimeError("Failed to obtain research summary (no final AI message without tool calls).")
+
+
+async def propose_action_node(state: State, config: RunnableConfig) -> dict[str, Any]:
+    """Take the research summary + issue details and produce a structured proposal.
+
+    Uses a second LLM call with structured output (Option 2 pattern from docs).
+    """
+    assert state.issue is not None, "Issue must be selected before proposal."
+    assert state.research_summary is not None, "Research summary required before proposal."
+    issue = state.issue
+    research_summary = state.research_summary
+    model = _build_llm()
+    # Use with_structured_output to force schema
+    structured = model.with_structured_output(ProposalModel)
+    # Provide only the distilled research to minimize tokens
+    system_prompt = PROPOSE_ACTION_PROMPT_TEMPLATE_JINJA.render()
+    user_content = (
+        f"Issue number: {issue['number']}\n"
+        f"Title: {issue['title']}\n"
+        f"URL: {issue['url']}\n"
+        f"UpdatedAt: {issue['updated_at']}\n"
+        f"Labels: {', '.join(issue['labels']) if issue.get('labels') else '(none)'}\n\n"
+        "Research summary:\n" + research_summary
     )
+    response: ProposalModel = structured.invoke([
+        ("system", system_prompt),
+        ("human", user_content),
+    ])
+    proposal_dict = response.model_dump()
+    return {"proposal": proposal_dict}
 
 
 async def review_issue_node(state: State, config: RunnableConfig) -> dict[str, Any]:
     """Interrupt for the single issue to approve/edit/skip posting a close comment."""
     assert state.proposal is not None, "Proposal must be parsed before review."
-    issue = state.proposal
-    number = issue.get("number")
-    title = issue.get("title")
-    url = issue.get("url")
-    suggested_comment = issue.get("suggested_comment")
-    can_close = issue.get("can_close")
+    # Identity lives in state.issue; proposed actions live in state.proposal
+    assert state.issue is not None, "Issue must be present during review."
+    proposal_actions = state.proposal
+    issue_identity = state.issue
+    number = issue_identity.get("number")
+    title = issue_identity.get("title")
+    url = issue_identity.get("url")
+    close_issue = proposal_actions.get("close_issue")
+    remove_label_for_stale = proposal_actions.get("remove_label_for_stale")
+    add_label_for_enhancement = proposal_actions.get("add_label_for_enhancement")
+    add_label_for_needs_more_info = proposal_actions.get("add_label_for_needs_more_info")
+    post_comment = proposal_actions.get("post_comment")
+    rationale = proposal_actions.get("rationale")
+    close_issue_rationale = proposal_actions.get("close_issue_rationale")
+    remove_label_for_stale_rationale = proposal_actions.get("remove_label_for_stale_rationale")
+    add_label_for_enhancement_rationale = proposal_actions.get("add_label_for_enhancement_rationale")
+    add_label_for_needs_more_info_rationale = proposal_actions.get("add_label_for_needs_more_info_rationale")
 
-    description = (
-        f"# Review Issue #{number}: {title}\n\n"
-        f"URL: {url}\n\n"
-        "If you approve, you're confirming this issue can be closed and the comment can be posted.\n\n"
-        "- Accept: approve as-is.\n"
-        "- Edit: update the suggested_comment and/or can_close.\n"
-        "- Respond: leave a note (no changes).\n"
-        "- Ignore: skip this issue.\n"
+    actions_for_template = [
+        {"name": "close_issue", "value": close_issue, "rationale": close_issue_rationale},
+        {"name": "remove_label_for_stale", "value": remove_label_for_stale, "rationale": remove_label_for_stale_rationale},
+        {"name": "add_label_for_enhancement", "value": add_label_for_enhancement, "rationale": add_label_for_enhancement_rationale},
+        {"name": "add_label_for_needs_more_info", "value": add_label_for_needs_more_info, "rationale": add_label_for_needs_more_info_rationale},
+        {"name": "post_comment", "value": bool(post_comment), "rationale": (post_comment[:140] + "…") if post_comment and len(post_comment) > 140 else post_comment},
+    ]
+    description = REVIEW_TEMPLATE_JINJA.render(
+        number=number,
+        title=title,
+        url=url,
+        actions=actions_for_template,
+        overall_rationale=rationale or "(none)",
     )
 
+    # Provide only editable action fields (not identity) to reduce accidental edits.
     action_request = ActionRequest(
-        action=f"Review issue closure: {title}",
+        action=f"Review maintenance actions: {title}",
         args={
-            "number": number,
-            "title": title,
-            "url": url,
-            "can_close": can_close,
-            "suggested_comment": suggested_comment,
+            "close_issue": close_issue,
+            "remove_label_for_stale": remove_label_for_stale,
+            "add_label_for_enhancement": add_label_for_enhancement,
+            "add_label_for_needs_more_info": add_label_for_needs_more_info,
+            "post_comment": post_comment,
         },
     )
     interrupt_config = HumanInterruptConfig(
@@ -332,29 +385,37 @@ async def review_issue_node(state: State, config: RunnableConfig) -> dict[str, A
 
     # Prepare a decision record for this issue
     decision: dict[str, Any] = {
-        "number": number,
+        "number": number,  # authoritative source from state.issue
         "approved": False,
-        "comment": None,
+        "close_issue": bool(close_issue),
+        "remove_label_for_stale": bool(remove_label_for_stale),
+        "add_label_for_enhancement": bool(add_label_for_enhancement),
+        "add_label_for_needs_more_info": bool(add_label_for_needs_more_info),
+        "post_comment": post_comment,
         "note": None,
     }
 
     rtype = human_response.get("type")
     if rtype in ("accept", "edit"):
-        # Expect an ActionRequest in args, with edited args under 'args'
         ar_raw: Any = human_response.get("args")
         if isinstance(ar_raw, dict):
             inner = ar_raw.get("args")
             ar_args: dict[str, Any] = inner if isinstance(inner, dict) else {}
         else:
             ar_args = {}
-        # Values may be strings; coerce can_close
-        updated_can_close = ar_args.get("can_close", can_close)
-        if isinstance(updated_can_close, str):
-            updated_can_close = updated_can_close.lower() in ("true", "1", "yes")
-        updated_comment = ar_args.get("suggested_comment", suggested_comment)
+        def _coerce_bool(val, default=False):
+            if isinstance(val, bool):
+                return val
+            if isinstance(val, str):
+                return val.lower() in ("true", "1", "yes")
+            return default
         decision.update({
-            "approved": bool(updated_can_close),
-            "comment": updated_comment,
+            "approved": True,
+            "close_issue": _coerce_bool(ar_args.get("close_issue", close_issue), close_issue),
+            "remove_label_for_stale": _coerce_bool(ar_args.get("remove_label_for_stale", remove_label_for_stale), remove_label_for_stale),
+            "add_label_for_enhancement": _coerce_bool(ar_args.get("add_label_for_enhancement", add_label_for_enhancement), add_label_for_enhancement),
+            "add_label_for_needs_more_info": _coerce_bool(ar_args.get("add_label_for_needs_more_info", add_label_for_needs_more_info), add_label_for_needs_more_info),
+            "post_comment": ar_args.get("post_comment", post_comment),
         })
     elif rtype == "response":
         note = human_response.get("args")
@@ -372,23 +433,57 @@ async def finalize_node(state: State, config: RunnableConfig) -> dict[str, Any]:
 
 
 async def apply_decision_node(state: State, config: RunnableConfig) -> dict[str, Any]:
-    """If approved, post the comment and close the issue via GraphQL. Otherwise do nothing."""
+    """Apply approved maintenance actions: labels, comment, close."""
     assert state.proposal is not None and state.decision is not None
-    issue = state.proposal
     decision = state.decision
-    number = int(issue.get("number"))
-    approved = bool(decision.get("approved"))
-    comment = (decision.get("comment") or "").strip()
-
-    if not approved:
+    if not decision.get("approved"):
         return {}
 
+    number = int(decision.get("number"))
+    close_issue = bool(decision.get("close_issue"))
+    remove_label_for_stale = bool(decision.get("remove_label_for_stale"))
+    add_label_for_enhancement = bool(decision.get("add_label_for_enhancement"))
+    add_label_for_needs_more_info = bool(decision.get("add_label_for_needs_more_info"))
+    post_comment = (decision.get("post_comment") or "").strip() or None
+
     client = GitHubClient()
-    # Ensure a non-empty comment; if empty, supply a generic one
-    close_comment = comment or (
-        "Closing as stale. If you're still affected, please open a new issue with updated details."
-    )
-    await client.close_issue_with_comment(TARGET_REPO, number, close_comment)
+
+    # 1. Remove stale label if requested
+    if remove_label_for_stale:
+        try:
+            await client.remove_label(TARGET_REPO, number, "Stale")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to remove Stale label on #%s: %s", number, exc)
+
+    # 2. Add labels as requested (avoid duplicate logic if both accidentally true)
+    if add_label_for_enhancement and add_label_for_needs_more_info:
+        # Prefer needs more info (user action required) – drop enhancement in this conflict.
+        add_label_for_enhancement = False
+    if add_label_for_enhancement:
+        try:
+            await client.add_label(TARGET_REPO, number, "enhancement")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to add enhancement label to #%s: %s", number, exc)
+    if add_label_for_needs_more_info:
+        try:
+            await client.add_label(TARGET_REPO, number, "needs more info")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to add needs more info label to #%s: %s", number, exc)
+
+    # 3. Post comment if provided
+    if post_comment:
+        try:
+            await client.post_comment(TARGET_REPO, number, post_comment)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to post comment on #%s: %s", number, exc)
+
+    # 4. Close issue if requested
+    if close_issue:
+        try:
+            await client.close_issue(TARGET_REPO, number)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to close issue #%s: %s", number, exc)
+
     return {}
 
 
@@ -397,14 +492,18 @@ TARGET_REPO = os.getenv("TARGET_REPO", "Azure-samples/azure-search-openai-demo")
 workflow = StateGraph(State)
 
 # Add nodes (single linear flow)
-workflow.add_node("stale_issues", stale_issues_node)
+workflow.add_node("select_issue", select_stale_issue_node)
+workflow.add_node("research_issue", research_issue_node)
+workflow.add_node("propose_action", propose_action_node)
 workflow.add_node("review_issue", review_issue_node)
 workflow.add_node("apply_decision", apply_decision_node)
 workflow.add_node("finalize", finalize_node)
 
 # Linear edges
-workflow.add_edge("__start__", "stale_issues")
-workflow.add_edge("stale_issues", "review_issue")
+workflow.add_edge("__start__", "select_issue")
+workflow.add_edge("select_issue", "research_issue")
+workflow.add_edge("research_issue", "propose_action")
+workflow.add_edge("propose_action", "review_issue")
 workflow.add_edge("review_issue", "apply_decision")
 workflow.add_edge("apply_decision", "finalize")
 

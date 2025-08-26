@@ -14,9 +14,11 @@ Notes:
 - This client uses GraphQL v4 exclusively.
 - All methods are async and use httpx.
 """
+
 from __future__ import annotations
 
 import os
+import logging
 from dataclasses import dataclass
 from typing import Any, Dict, List
 
@@ -149,12 +151,16 @@ class GitHubClient:
         after: str | None = None
         page_size = min(50, max_results)
         while True:
-            data = await self._graphql(query, {"q": q, "first": page_size, "after": after})
+            data = await self._graphql(
+                query, {"q": q, "first": page_size, "after": after}
+            )
             search = data["search"]
             for node in search["nodes"]:
                 if node.get("__typename") != "Issue":
                     continue
-                labels = [n["name"] for n in (node.get("labels", {}).get("nodes", []) or [])]
+                labels = [
+                    n["name"] for n in (node.get("labels", {}).get("nodes", []) or [])
+                ]
                 item = IssueItem(
                     id=node["id"],
                     number=node["number"],
@@ -175,7 +181,9 @@ class GitHubClient:
             after = search["pageInfo"]["endCursor"]
         return results
 
-    async def close_issue_with_comment(self, repo: str, issue_number: int, comment: str) -> Dict[str, Any]:
+    async def close_issue_with_comment(
+        self, repo: str, issue_number: int, comment: str
+    ) -> Dict[str, Any]:
         """Post a comment on an issue then close it."""
         owner, name = self._split_repo(repo)
         get_issue_q = """
@@ -185,7 +193,9 @@ class GitHubClient:
           }
         }
         """
-        data = await self._graphql(get_issue_q, {"owner": owner, "name": name, "number": issue_number})
+        data = await self._graphql(
+            get_issue_q, {"owner": owner, "name": name, "number": issue_number}
+        )
         issue = data["repository"]["issue"]
         if not issue:
             raise RuntimeError(f"Issue #{issue_number} not found in {repo}")
@@ -196,7 +206,9 @@ class GitHubClient:
           addComment(input: $input) { clientMutationId }
         }
         """
-        await self._graphql(add_comment_mut, {"input": {"subjectId": issue_id, "body": comment}})
+        await self._graphql(
+            add_comment_mut, {"input": {"subjectId": issue_id, "body": comment}}
+        )
 
         close_issue_mut = """
         mutation($input: CloseIssueInput!) {
@@ -205,7 +217,208 @@ class GitHubClient:
         """
         data2 = await self._graphql(close_issue_mut, {"input": {"issueId": issue_id}})
         closed = data2["closeIssue"]["issue"]
-        return {"number": closed["number"], "state": closed["state"], "url": issue["url"]}
+        return {
+            "number": closed["number"],
+            "state": closed["state"],
+            "url": issue["url"],
+        }
+
+    async def post_comment(self, repo: str, issue_number: int, body: str) -> None:
+        """Post a comment on an issue without changing its state."""
+        owner, name = self._split_repo(repo)
+        get_issue_q = """
+            query($owner: String!, $name: String!, $number: Int!) {
+                repository(owner: $owner, name: $name) { issue(number: $number) { id } }
+            }
+            """
+        data = await self._graphql(
+            get_issue_q, {"owner": owner, "name": name, "number": issue_number}
+        )
+        issue = data["repository"]["issue"]
+        if not issue:
+            raise RuntimeError(f"Issue #{issue_number} not found in {repo}")
+        issue_id = issue["id"]
+        add_comment_mut = """
+            mutation($input: AddCommentInput!) { addComment(input: $input) { clientMutationId } }
+            """
+        await self._graphql(
+            add_comment_mut, {"input": {"subjectId": issue_id, "body": body}}
+        )
+
+    async def close_issue(self, repo: str, issue_number: int) -> None:
+        """Close an issue without commenting."""
+        owner, name = self._split_repo(repo)
+        get_issue_q = """
+            query($owner: String!, $name: String!, $number: Int!) {
+                repository(owner: $owner, name: $name) { issue(number: $number) { id } }
+            }
+            """
+        data = await self._graphql(
+            get_issue_q, {"owner": owner, "name": name, "number": issue_number}
+        )
+        issue = data["repository"]["issue"]
+        if not issue:
+            raise RuntimeError(f"Issue #{issue_number} not found in {repo}")
+        issue_id = issue["id"]
+        close_issue_mut = """
+            mutation($input: CloseIssueInput!) { closeIssue(input: $input) { issue { number state } } }
+            """
+        await self._graphql(close_issue_mut, {"input": {"issueId": issue_id}})
+
+    async def add_label(self, repo: str, issue_number: int, label: str) -> None:
+        """Add a label to an issue (creates if repository already has it)."""
+        owner, name = self._split_repo(repo)
+        # Fetch label id or create it
+        label_query = """
+            query($owner: String!, $name: String!, $label: String!) {
+                repository(owner: $owner, name: $name) {
+                    label(name: $label) { id name }
+                    issue(number: $number) { id }
+                }
+            }
+            """
+        data = await self._graphql(
+            label_query,
+            {"owner": owner, "name": name, "label": label, "number": issue_number},
+        )
+        repo_node = data["repository"]
+        issue = repo_node.get("issue")
+        if not issue:
+            raise RuntimeError(f"Issue #{issue_number} not found in {repo}")
+        issue_id = issue["id"]
+        label_node = repo_node.get("label")
+        if not label_node:
+            # Create label
+            create_label_mut = """
+                    mutation($input: CreateLabelInput!) { createLabel(input: $input) { label { id name } } }
+                    """
+            color = "ededed"
+            create_res = await self._graphql(
+                create_label_mut,
+                {
+                    "input": {
+                        "repositoryId": repo_node.get("id"),
+                        "name": label,
+                        "color": color,
+                    }
+                },
+            )
+            label_id = create_res["createLabel"]["label"]["id"]
+        else:
+            label_id = label_node["id"]
+        add_labels_mut = """
+            mutation($input: AddLabelsToLabelableInput!) { addLabelsToLabelable(input: $input) { clientMutationId } }
+            """
+        await self._graphql(
+            add_labels_mut, {"input": {"labelIds": [label_id], "labelableId": issue_id}}
+        )
+
+    async def remove_label(self, repo: str, issue_number: int, label: str) -> None:
+        """Remove a label from an issue if present."""
+        owner, name = self._split_repo(repo)
+        label_query = """
+            query($owner: String!, $name: String!, $label: String!, $number: Int!) {
+                repository(owner: $owner, name: $name) {
+                    label(name: $label) { id name }
+                    issue(number: $number) { id labels(first: 50) { nodes { id name } } }
+                }
+            }
+            """
+        data = await self._graphql(
+            label_query,
+            {"owner": owner, "name": name, "label": label, "number": issue_number},
+        )
+        repo_node = data["repository"]
+        issue = repo_node.get("issue")
+        if not issue:
+            raise RuntimeError(f"Issue #{issue_number} not found in {repo}")
+        issue_id = issue["id"]
+        labels_conn = issue.get("labels") or {}
+        nodes = labels_conn.get("nodes") or []
+        target = next((n for n in nodes if n.get("name") == label), None)
+        if not target:
+            return  # label not present
+        remove_labels_mut = """
+            mutation($input: RemoveLabelsFromLabelableInput!) { removeLabelsFromLabelable(input: $input) { clientMutationId } }
+            """
+        await self._graphql(
+            remove_labels_mut,
+            {"input": {"labelIds": [target["id"]], "labelableId": issue_id}},
+        )
+
+    async def get_issue(
+        self,
+        repo: str,
+        issue_number: int,
+        include_comments: bool = True,
+        comments_limit: int = 50,
+    ) -> Dict[str, Any] | None:
+        """Fetch a single issue (and optionally recent comments) by number.
+
+        Args:
+            repo: owner/name
+            issue_number: The issue number.
+            include_comments: Whether to include up to `comments_limit` latest comments.
+            comments_limit: Max number of comments to fetch.
+
+        Returns:
+            Dict with issue fields or None if not found.
+        """
+        owner, name = self._split_repo(repo)
+        query_issue = """
+        query($owner: String!, $name: String!, $number: Int!, $n: Int!) {
+          repository(owner: $owner, name: $name) {
+            issue(number: $number) {
+              id number title url state updatedAt createdAt author { login }
+              body
+              labels(first: 20) { nodes { name } }
+              comments(first: $n) {
+                pageInfo { hasNextPage endCursor }
+                nodes { id author { login } createdAt body }
+              }
+            }
+          }
+        }
+        """
+        data = await self._graphql(
+            query_issue,
+            {
+                "owner": owner,
+                "name": name,
+                "number": issue_number,
+                "n": max(0, comments_limit),
+            },
+        )
+        repo_node = data.get("repository") or {}
+        issue = repo_node.get("issue") if isinstance(repo_node, dict) else None
+        if not issue:
+            return None
+        labels = [n["name"] for n in (issue.get("labels", {}).get("nodes", []) or [])]
+        result: Dict[str, Any] = {
+            "id": issue.get("id"),
+            "number": issue.get("number"),
+            "title": issue.get("title"),
+            "url": issue.get("url"),
+            "state": issue.get("state"),
+            "updatedAt": issue.get("updatedAt"),
+            "createdAt": issue.get("createdAt"),
+            "author": (issue.get("author") or {}).get("login"),
+            "labels": labels,
+            "body": issue.get("body") or "",
+        }
+        if include_comments:
+            comments_conn = issue.get("comments") or {}
+            nodes = comments_conn.get("nodes") or []
+            result["comments"] = [
+                {
+                    "id": c.get("id"),
+                    "author": (c.get("author") or {}).get("login"),
+                    "createdAt": c.get("createdAt"),
+                    "body": c.get("body") or "",
+                }
+                for c in nodes
+            ]
+        return result
 
     async def get_issue_comments(
         self,
@@ -241,17 +454,21 @@ class GitHubClient:
         }
         """
         while True:
-            n = min(page_size, max_comments - len(comments)) if max_comments is not None else page_size
+            n = (
+                min(page_size, max_comments - len(comments))
+                if max_comments is not None
+                else page_size
+            )
             if n <= 0:
                 break
             data = await self._graphql(
                 q,
                 {
-                "owner": owner,
-                "name": name,
-                "number": issue_number,
-                "n": n,
-                "after": after,
+                    "owner": owner,
+                    "name": name,
+                    "number": issue_number,
+                    "n": n,
+                    "after": after,
                 },
             )
             repo_node = data.get("repository") or {}
@@ -262,12 +479,12 @@ class GitHubClient:
             nodes = comments_conn.get("nodes") or []
             for c in nodes:
                 comments.append(
-                {
-                    "id": c.get("id"),
-                    "author": (c.get("author") or {}).get("login"),
-                    "createdAt": c.get("createdAt"),
-                    "body": c.get("body") or "",
-                }
+                    {
+                        "id": c.get("id"),
+                        "author": (c.get("author") or {}).get("login"),
+                        "createdAt": c.get("createdAt"),
+                        "body": c.get("body") or "",
+                    }
                 )
                 if max_comments is not None and len(comments) >= max_comments:
                     return comments
@@ -307,7 +524,9 @@ class GitHubClient:
         page_size = min(50, max_results)
         issues: List[Dict[str, Any]] = []
         while True and len(issues) < max_results:
-            data = await self._graphql(search_q, {"q": q, "first": page_size, "after": after})
+            data = await self._graphql(
+                search_q, {"q": q, "first": page_size, "after": after}
+            )
             search = data["search"]
             for node in search["nodes"]:
                 if node.get("__typename") != "Issue":
@@ -331,7 +550,10 @@ class GitHubClient:
                         "updatedAt": it["updatedAt"],
                         "createdAt": it["createdAt"],
                         "author": (it.get("author") or {}).get("login"),
-                        "labels": [n["name"] for n in (it.get("labels", {}).get("nodes", []) or [])],
+                        "labels": [
+                            n["name"]
+                            for n in (it.get("labels", {}).get("nodes", []) or [])
+                        ],
                         "body": it.get("body") or "",
                     }
                 )
@@ -351,9 +573,11 @@ class GitHubClient:
               }
             }
             """
-            detail = await self._graphql(comments_q, {"id": it["id"], "n": comments_limit})
+            detail = await self._graphql(
+                comments_q, {"id": it["id"], "n": comments_limit}
+            )
             node = detail["node"] or {}
-            comments = ((node.get("comments") or {}).get("nodes") or [])
+            comments = (node.get("comments") or {}).get("nodes") or []
             results.append(
                 {
                     "id": it["id"],
@@ -364,7 +588,9 @@ class GitHubClient:
                     "updatedAt": it["updatedAt"],
                     "createdAt": it["createdAt"],
                     "author": (it.get("author") or {}).get("login"),
-                    "labels": [n["name"] for n in (it.get("labels", {}).get("nodes", []) or [])],
+                    "labels": [
+                        n["name"] for n in (it.get("labels", {}).get("nodes", []) or [])
+                    ],
                     "body": it.get("body") or "",
                     "comments": [
                         {
@@ -410,7 +636,13 @@ class GitHubClient:
                 snippet = None
                 if text_matches and isinstance(text_matches, list):
                     # Join all fragments for simplicity
-                    snippet = "\n".join([m.get("fragment", "") for m in text_matches if m.get("fragment")])
+                    snippet = "\n".join(
+                        [
+                            m.get("fragment", "")
+                            for m in text_matches
+                            if m.get("fragment")
+                        ]
+                    )
                 if include_text:
                     # Fetch file content
                     contents_url = item["url"].replace("/search/code", "/repos")
@@ -419,8 +651,11 @@ class GitHubClient:
                     file_data = file_resp.json()
                     if file_data.get("encoding") == "base64":
                         import base64
+
                         try:
-                            text = base64.b64decode(file_data["content"]).decode("utf-8", errors="replace")
+                            text = base64.b64decode(file_data["content"]).decode(
+                                "utf-8", errors="replace"
+                            )
                         except Exception:
                             is_binary = True
                             text = None
@@ -473,9 +708,9 @@ class GitHubClient:
             data = resp.json()
             items = data.get("items", [])
             if not items:
-                print(f"No items found for: {search_query}")
+                logging.debug("No items found for: %s", search_query)
                 return None
-            print(f"Found {len(items)} items for: {search_query}")
+            logging.debug("Found %d items for: %s", len(items), search_query)
             item = items[0]
             repo_nwo = item["repository"]["full_name"]
             path = item["path"]
@@ -485,7 +720,9 @@ class GitHubClient:
             text_matches = item.get("text_matches")
             snippet = None
             if text_matches and isinstance(text_matches, list):
-                snippet = "\n".join([m.get("fragment", "") for m in text_matches if m.get("fragment")])
+                snippet = "\n".join(
+                    [m.get("fragment", "") for m in text_matches if m.get("fragment")]
+                )
             if include_text:
                 contents_url = item["url"].replace("/search/code", "/repos")
                 file_resp = await client.get(contents_url, headers=self.headers)
@@ -493,8 +730,11 @@ class GitHubClient:
                 file_data = file_resp.json()
                 if file_data.get("encoding") == "base64":
                     import base64
+
                     try:
-                        text = base64.b64decode(file_data["content"]).decode("utf-8", errors="replace")
+                        text = base64.b64decode(file_data["content"]).decode(
+                            "utf-8", errors="replace"
+                        )
                     except Exception:
                         is_binary = True
                         text = None

@@ -1,0 +1,23 @@
+# Review Issue #{{ number }}: {{ title }}
+
+URL: {{ url }}
+
+## Proposed Actions
+| Action | Value | Rationale |
+|--------|-------|-----------|
+{%- for a in actions %}
+| {{ a.name }} | {{ a.value }} | {{ a.rationale|default('—') }} |
+{%- endfor %}
+
+### Overall Rationale
+
+{{ overall_rationale }}
+
+### Next steps
+
+Then you can either:
+
+- Accept: approve as-is.
+- Edit: modify any of the fields.
+- Respond: leave a note (no changes).
+- Ignore: skip this issue.
