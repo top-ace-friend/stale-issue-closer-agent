@@ -87,6 +87,8 @@ class ProposalModel(BaseModel):
     add_label_for_enhancement_rationale: str | None = Field(default=None, description="Evidence that this is (or is not) an enhancement request.")
     add_label_for_needs_more_info: bool = Field(description="Whether to add the 'needs more info' label (request clarification/details)")
     add_label_for_needs_more_info_rationale: str | None = Field(default=None, description="Why additional info is required or not necessary.")
+    assign_issue_to_copilot: bool = Field(description="Whether to assign the issue to the Copilot agent because it appears trivial with an easy / well-bounded fix")
+    assign_issue_to_copilot_rationale: str | None = Field(default=None, description="Evidence that the issue is trivial and suitable for automated Copilot agent fix, or why not.")
     post_comment: str | None = Field(
         default=None, description="Optional comment to post (explanatory or request for info)"
     )
@@ -178,6 +180,28 @@ async def tool_search_code(query: str) -> str:
     )
     return json.dumps([h.__dict__ for h in hits])
 
+@tool("search_pull_requests")
+async def tool_search_pull_requests(query: str) -> str:
+    """Search pull requests in the target repo.
+
+    Guidance:
+    - The repo qualifier (repo:owner/name) and is:pr are added automatically; don't include them.
+    - You may supply additional qualifiers like: `is:open`, `author:login`, `label:bug`, `draft:true`.
+    - Use this to find related implementation discussions, recent changes, or precedent decisions.
+
+    Args:
+        query: Free-text and/or qualifiers (without the repo qualifier or is:pr).
+
+    Returns:
+    JSON list of pull request objects (up to 5). Each contains: id, number, title, url,
+    body (description), merged (bool), mergedAt, createdAt, updatedAt.
+    """
+    client = GitHubClient()
+    pulls = await client.search_pull_requests(
+    TARGET_REPO, query_text=query, max_results=5
+    )
+    return json.dumps(pulls)
+
 @tool("fetch_file")
 async def tool_fetch_file(filename_or_path: str) -> str:
     """Fetch a file from the repository.
@@ -206,6 +230,35 @@ async def tool_get_issue(issue_number: int) -> str:
     client = GitHubClient()
     issue = await client.get_issue(TARGET_REPO, issue_number, include_comments=True, comments_limit=50)
     return json.dumps(issue or {})
+
+@tool("get_pull_request")
+async def tool_get_pull_request(pr_number: int) -> str:
+    """Fetch a single pull request by its number.
+
+    Returns JSON with: number, title, url, description, merged, mergedAt.
+    Empty JSON object if not found.
+    """
+    client = GitHubClient()
+    try:
+        pr = await client.get_pull_request(TARGET_REPO, pr_number)
+    except Exception as exc:  # noqa: BLE001
+        return json.dumps({"error": str(exc)})
+    return json.dumps(pr or {})
+
+@tool("list_repository_files")
+async def tool_list_repository_files(ref: str | None = None) -> str:
+    """List all file paths in the target repository at a ref (default branch if omitted).
+
+    Args:
+        ref: Optional branch / tag / commit SHA. If not provided, resolves to default branch.
+
+    Returns:
+        JSON array of file path strings. May be incomplete for very large repos (tree truncation).
+    """
+    client = GitHubClient()
+    paths = await client.list_repository_files(TARGET_REPO, ref=ref)
+    return json.dumps(paths)
+
 
 async def select_stale_issue_node(state: State, config: RunnableConfig) -> dict[str, Any]:
     """Fetch stale issues and pick one (currently first in list) and its comments.
@@ -241,7 +294,15 @@ async def research_issue_node(state: State, config: RunnableConfig) -> dict[str,
     assert state.issue is not None, "Issue must be selected before research."
     issue = state.issue
     model = _build_llm()
-    research_tools = [tool_search_issues, tool_search_code, tool_fetch_file, tool_get_issue]
+    research_tools = [
+        tool_search_issues,
+        tool_search_code,
+        tool_search_pull_requests,
+        tool_get_pull_request,
+        tool_fetch_file,
+        tool_get_issue,
+        tool_list_repository_files,
+    ]
     agent = create_react_agent(model, research_tools)
     all_comments = issue.get("comments", [])
     prompt = RESEARCH_PROMPT_TEMPLATE_JINJA.render(
@@ -305,7 +366,10 @@ async def propose_action_node(state: State, config: RunnableConfig) -> dict[str,
     # Use with_structured_output to force schema
     structured = model.with_structured_output(ProposalModel)
     # Provide only the distilled research to minimize tokens
-    system_prompt = PROPOSE_ACTION_PROMPT_TEMPLATE_JINJA.render()
+    # Always fetch the authenticated viewer login via GitHub API (no env var usage)
+    gh = GitHubClient()
+    maintainer_username = await gh.get_viewer_login()
+    system_prompt = PROPOSE_ACTION_PROMPT_TEMPLATE_JINJA.render(maintainer_username=maintainer_username)
     user_content = (
         f"Issue number: {issue['number']}\n"
         f"Title: {issue['title']}\n"
@@ -342,12 +406,15 @@ async def review_issue_node(state: State, config: RunnableConfig) -> dict[str, A
     remove_label_for_stale_rationale = proposal_actions.get("remove_label_for_stale_rationale")
     add_label_for_enhancement_rationale = proposal_actions.get("add_label_for_enhancement_rationale")
     add_label_for_needs_more_info_rationale = proposal_actions.get("add_label_for_needs_more_info_rationale")
+    assign_issue_to_copilot = proposal_actions.get("assign_issue_to_copilot")
+    assign_issue_to_copilot_rationale = proposal_actions.get("assign_issue_to_copilot_rationale")
 
     actions_for_template = [
         {"name": "close_issue", "value": close_issue, "rationale": close_issue_rationale},
         {"name": "remove_label_for_stale", "value": remove_label_for_stale, "rationale": remove_label_for_stale_rationale},
         {"name": "add_label_for_enhancement", "value": add_label_for_enhancement, "rationale": add_label_for_enhancement_rationale},
         {"name": "add_label_for_needs_more_info", "value": add_label_for_needs_more_info, "rationale": add_label_for_needs_more_info_rationale},
+    {"name": "assign_issue_to_copilot", "value": assign_issue_to_copilot, "rationale": assign_issue_to_copilot_rationale},
         {"name": "post_comment", "value": bool(post_comment), "rationale": (post_comment[:140] + "…") if post_comment and len(post_comment) > 140 else post_comment},
     ]
     description = REVIEW_TEMPLATE_JINJA.render(
@@ -366,6 +433,7 @@ async def review_issue_node(state: State, config: RunnableConfig) -> dict[str, A
             "remove_label_for_stale": remove_label_for_stale,
             "add_label_for_enhancement": add_label_for_enhancement,
             "add_label_for_needs_more_info": add_label_for_needs_more_info,
+            "assign_issue_to_copilot": assign_issue_to_copilot,
             "post_comment": post_comment,
         },
     )
@@ -391,6 +459,7 @@ async def review_issue_node(state: State, config: RunnableConfig) -> dict[str, A
         "remove_label_for_stale": bool(remove_label_for_stale),
         "add_label_for_enhancement": bool(add_label_for_enhancement),
         "add_label_for_needs_more_info": bool(add_label_for_needs_more_info),
+    "assign_issue_to_copilot": bool(assign_issue_to_copilot),
         "post_comment": post_comment,
         "note": None,
     }
@@ -415,6 +484,7 @@ async def review_issue_node(state: State, config: RunnableConfig) -> dict[str, A
             "remove_label_for_stale": _coerce_bool(ar_args.get("remove_label_for_stale", remove_label_for_stale), remove_label_for_stale),
             "add_label_for_enhancement": _coerce_bool(ar_args.get("add_label_for_enhancement", add_label_for_enhancement), add_label_for_enhancement),
             "add_label_for_needs_more_info": _coerce_bool(ar_args.get("add_label_for_needs_more_info", add_label_for_needs_more_info), add_label_for_needs_more_info),
+            "assign_issue_to_copilot": _coerce_bool(ar_args.get("assign_issue_to_copilot", assign_issue_to_copilot), assign_issue_to_copilot),
             "post_comment": ar_args.get("post_comment", post_comment),
         })
     elif rtype == "response":
@@ -444,6 +514,7 @@ async def apply_decision_node(state: State, config: RunnableConfig) -> dict[str,
     remove_label_for_stale = bool(decision.get("remove_label_for_stale"))
     add_label_for_enhancement = bool(decision.get("add_label_for_enhancement"))
     add_label_for_needs_more_info = bool(decision.get("add_label_for_needs_more_info"))
+    assign_issue_to_copilot = bool(decision.get("assign_issue_to_copilot"))
     post_comment = (decision.get("post_comment") or "").strip() or None
 
     client = GitHubClient()
@@ -477,7 +548,14 @@ async def apply_decision_node(state: State, config: RunnableConfig) -> dict[str,
         except Exception as exc:  # noqa: BLE001
             logger.warning("Failed to post comment on #%s: %s", number, exc)
 
-    # 4. Close issue if requested
+    # 4. Assign to Copilot if requested (before potentially closing to keep it open for automated work)
+    if assign_issue_to_copilot and not close_issue:
+        try:
+            await client.assign_issue_to_copilot(TARGET_REPO, number)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to assign Copilot on #%s: %s", number, exc)
+
+    # 5. Close issue if requested
     if close_issue:
         try:
             await client.close_issue(TARGET_REPO, number)

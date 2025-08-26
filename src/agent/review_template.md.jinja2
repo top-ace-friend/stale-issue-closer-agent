@@ -3,11 +3,14 @@
 URL: {{ url }}
 
 ## Proposed Actions
-| Action | Value | Rationale |
-|--------|-------|-----------|
-{%- for a in actions %}
-| {{ a.name }} | {{ a.value }} | {{ a.rationale|default('—') }} |
-{%- endfor %}
+
+{% for a in actions %}
+- **{{ a.name }}**: {% if a.value is sameas true %}✅ {% endif %}{{ a.value }}
+	{% if a.rationale %}
+	- Rationale:
+		{{ a.rationale | replace('\n', '\n    ') }}
+	{% endif %}
+{% endfor %}
 
 ### Overall Rationale
 

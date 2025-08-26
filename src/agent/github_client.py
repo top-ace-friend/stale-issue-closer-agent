@@ -1,24 +1,26 @@
-"""GitHub GraphQL client for repo maintenance tasks.
+"""GitHub client for repo maintenance tasks (GraphQL + selected REST endpoints).
 
 Functions provided:
 - find_stale_open_issues
 - close_issue_with_comment
 - search_issues_with_bodies
-- search_codebase
+- search_codebase (REST /search/code)
+- fetch_file (REST /search/code + contents)
+- list_repository_files (REST git trees API)
 
 Authentication:
 - Uses a GitHub token with repo read/write and search scopes.
 - Reads from env var GITHUB_TOKEN by default; can be passed explicitly.
 
 Notes:
-- This client uses GraphQL v4 exclusively.
+- Primarily uses GraphQL v4; some helper methods use REST endpoints where GraphQL lacks feature parity (code search, file fetch, tree listing).
 - All methods are async and use httpx.
 """
 
 from __future__ import annotations
 
-import os
 import logging
+import os
 from dataclasses import dataclass
 from typing import Any, Dict, List
 
@@ -94,6 +96,27 @@ class GitHubClient:
             "Accept": "application/vnd.github+json",
         }
         self.timeout = httpx.Timeout(timeout)
+        self._viewer_login: str | None = None  # cache for authenticated user login
+
+    async def get_viewer_login(self) -> str:
+        """Return the login of the authenticated user (GitHub token owner).
+
+        Uses a lightweight GraphQL query and caches the result for subsequent calls.
+        Falls back to 'maintainer' if the query unexpectedly fails.
+        """
+        if self._viewer_login:
+            return self._viewer_login
+        query = """
+        query { viewer { login } }
+        """
+        try:
+            data = await self._graphql(query, {})
+            viewer = data.get("viewer") if isinstance(data, dict) else None
+            login = (viewer or {}).get("login") or "maintainer"
+            self._viewer_login = login
+            return login
+        except Exception:  # noqa: BLE001
+            return "maintainer"
 
     async def _graphql(self, query: str, variables: Dict[str, Any]) -> Dict[str, Any]:
         async with httpx.AsyncClient(timeout=self.timeout) as client:
@@ -264,6 +287,127 @@ class GitHubClient:
             mutation($input: CloseIssueInput!) { closeIssue(input: $input) { issue { number state } } }
             """
         await self._graphql(close_issue_mut, {"input": {"issueId": issue_id}})
+
+    async def assign_issue_to_copilot(self, repo: str, issue_number: int, copilot_login: str = "copilot-swe-agent") -> dict[str, Any]:
+        """Assign an existing issue to the GitHub Copilot agent bot.
+
+        This uses the GraphQL API to:
+        1. Fetch the issue node ID and repository suggested actors (CAN_BE_ASSIGNED).
+        2. Locate the Copilot bot's node ID by login (default: "copilot-swe-agent").
+        3. Call addAssigneesToAssignable to assign the issue to Copilot.
+
+        Args:
+            repo: Full repository name ("owner/name").
+            issue_number: Issue number to assign.
+            copilot_login: Login of the Copilot bot (override if different in future).
+
+        Returns:
+            Dict with keys: number, url, assigned (bool), assignee_login.
+
+        Raises:
+            RuntimeError: If the issue or Copilot bot cannot be found / assignment fails.
+        """
+        owner, name = self._split_repo(repo)
+        query = """
+        query($owner: String!, $name: String!, $number: Int!) {
+          repository(owner: $owner, name: $name) {
+            id
+            suggestedActors(capabilities: [CAN_BE_ASSIGNED], first: 100) {
+              nodes { login __typename ... on Bot { id } ... on User { id } }
+            }
+            issue(number: $number) { id number url }
+          }
+        }
+        """
+        data = await self._graphql(query, {"owner": owner, "name": name, "number": issue_number})
+        repo_node = data.get("repository") if isinstance(data, dict) else None
+        if not repo_node:
+            raise RuntimeError(f"Repository {repo} not found")
+        issue = (repo_node.get("issue") if isinstance(repo_node, dict) else None) or None
+        if not issue:
+            raise RuntimeError(f"Issue #{issue_number} not found in {repo}")
+        issue_id = issue.get("id")
+        suggested = ((repo_node.get("suggestedActors") or {}).get("nodes") or []) if isinstance(repo_node, dict) else []
+        copilot_node = next((n for n in suggested if n.get("login") == copilot_login and n.get("id")), None)
+
+        # If Copilot is not in suggested assignable actors, do a lightweight REST attempt before giving up.
+        if not copilot_node:
+            logging.warning(
+                "Copilot '%s' not present in suggested assignable actors for %s; attempting REST fallback.",
+                copilot_login,
+                repo,
+            )
+            return await self._assign_issue_via_rest(repo, issue_number, copilot_login, issue.get("url"))
+
+        # If the node is a Bot, GitHub currently rejects addAssigneesToAssignable with NOT_FOUND (expects User IDs).
+        typename = copilot_node.get("__typename")
+        if typename == "Bot":
+            logging.info(
+                "Suggested actor '%s' is a Bot; attempting REST fallback instead of GraphQL assignment.",
+                copilot_login,
+            )
+            return await self._assign_issue_via_rest(repo, issue_number, copilot_login, issue.get("url"))
+
+        mutation = """
+        mutation($assignableId: ID!, $assigneeIds: [ID!]!) {
+          addAssigneesToAssignable(input: {assignableId: $assignableId, assigneeIds: $assigneeIds}) {
+            assignable { ... on Issue { number url } }
+          }
+        }
+        """
+        try:
+            add_res = await self._graphql(
+                mutation,
+                {"assignableId": issue_id, "assigneeIds": [copilot_node["id"]]},
+            )
+        except Exception as exc:  # noqa: BLE001
+            # Specific handling for NOT_FOUND referencing BOT_ ids – fallback to REST
+            msg = str(exc)
+            if "BOT_" in msg and "NOT_FOUND" in msg:
+                logging.warning(
+                    "GraphQL assignment failed due to bot ID (NOT_FOUND). Falling back to REST: %s",
+                    msg,
+                )
+                return await self._assign_issue_via_rest(repo, issue_number, copilot_login, issue.get("url"))
+            logging.error("Failed assigning Copilot to #%s in %s: %s", issue_number, repo, exc)
+            return {"number": issue.get("number"), "url": issue.get("url"), "assigned": False, "assignee_login": copilot_login, "reason": str(exc)}
+        assignable = ((add_res.get("addAssigneesToAssignable") or {}).get("assignable") if isinstance(add_res, dict) else None) or {}
+        number = assignable.get("number", issue.get("number"))
+        url = assignable.get("url", issue.get("url"))
+        return {"number": number, "url": url, "assigned": True, "assignee_login": copilot_login}
+
+    async def _assign_issue_via_rest(self, repo: str, issue_number: int, login: str, issue_url: str | None) -> dict[str, Any]:
+        """Fallback assignment using REST Issues API.
+
+        GitHub currently may not allow assigning certain bot accounts via GraphQL (expects a User node ID),
+        so we try the classic REST endpoint. If this also fails, we return a non-fatal result.
+        """
+        owner, name = self._split_repo(repo)
+        url = f"https://api.github.com/repos/{owner}/{name}/issues/{issue_number}/assignees"
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            try:
+                resp = await client.post(url, headers=self.headers, json={"assignees": [login]})
+                if resp.status_code in (201, 200):
+                    return {"number": issue_number, "url": issue_url, "assigned": True, "assignee_login": login, "via": "rest"}
+                # If unprocessable or not found, treat as not assignable.
+                logging.warning(
+                    "REST assignment of %s to #%s in %s failed (%s): %s",
+                    login,
+                    issue_number,
+                    repo,
+                    resp.status_code,
+                    resp.text,
+                )
+                return {"number": issue_number, "url": issue_url, "assigned": False, "assignee_login": login, "via": "rest", "reason": f"HTTP {resp.status_code}"}
+            except Exception as exc:  # noqa: BLE001
+                logging.warning(
+                    "REST assignment exception for %s on #%s in %s: %s",
+                    login,
+                    issue_number,
+                    repo,
+                    exc,
+                )
+                return {"number": issue_number, "url": issue_url, "assigned": False, "assignee_login": login, "via": "rest", "reason": str(exc)}
 
     async def add_label(self, repo: str, issue_number: int, label: str) -> None:
         """Add a label to an issue (creates if repository already has it)."""
@@ -604,6 +748,107 @@ class GitHubClient:
             )
         return results
 
+    async def search_pull_requests(
+        self,
+        repo: str,
+        query_text: str,
+        max_results: int = 50,
+    ) -> List[Dict[str, Any]]:
+        """Search pull requests and return minimal metadata.
+
+        Only the following fields are returned per PR:
+            number, title, url, body (description), merged (bool), mergedAt (ISO datetime), createdAt, updatedAt.
+
+        Args:
+            repo: "owner/name" repository identifier.
+            query_text: Additional search terms/qualifiers (is:pr is added automatically).
+            max_results: Cap on number of pull requests returned.
+        """
+        owner, name = self._split_repo(repo)
+        q = f"repo:{owner}/{name} is:pr {query_text}".strip()
+        search_q = """
+        query($q: String!, $first: Int!, $after: String) {
+          search(query: $q, type: ISSUE, first: $first, after: $after) {
+            pageInfo { hasNextPage endCursor }
+            nodes {
+              __typename
+              ... on PullRequest {
+                id number title url updatedAt createdAt author { login }
+                body merged mergedAt
+              }
+            }
+          }
+        }
+        """
+        after: str | None = None
+        page_size = min(50, max_results)
+        pulls: List[Dict[str, Any]] = []
+        while True and len(pulls) < max_results:
+            data = await self._graphql(search_q, {"q": q, "first": page_size, "after": after})
+            search = data["search"]
+            for node in search["nodes"]:
+                # The SEARCH type ISSUE returns PullRequest and Issue union; filter PRs
+                if node.get("__typename") != "PullRequest":
+                    continue
+                pulls.append(node)
+                if len(pulls) >= max_results:
+                    break
+            if not search["pageInfo"]["hasNextPage"] or len(pulls) >= max_results:
+                break
+            after = search["pageInfo"]["endCursor"]
+
+        # Return only the minimal fields required by the caller to save tokens.
+        return [
+            {
+                "number": pr["number"],
+                "title": pr["title"],
+                "url": pr["url"],  # kept for human reference
+                "description": pr.get("body") or "",
+                "merged": pr.get("merged"),
+                "mergedAt": pr.get("mergedAt"),
+            }
+            for pr in pulls
+        ]
+
+    async def get_pull_request(
+            self,
+            repo: str,
+            pr_number: int,
+    ) -> Dict[str, Any] | None:
+            """Fetch a single pull request by number, mirroring search_pull_requests fields.
+
+            Returns dict with keys: number, title, url, description, merged, mergedAt
+            or None if not found.
+            """
+            owner, name = self._split_repo(repo)
+            query = """
+            query($owner: String!, $name: String!, $number: Int!) {
+                repository(owner: $owner, name: $name) {
+                    pullRequest(number: $number) {
+                        id number title url body merged mergedAt
+                    }
+                }
+            }
+            """
+            data = await self._graphql(
+                    query,
+                    {"owner": owner, "name": name, "number": pr_number},
+            )
+            repo_node = data.get("repository") if isinstance(data, dict) else None
+            if not repo_node:
+                    return None
+            pr = repo_node.get("pullRequest") if isinstance(repo_node, dict) else None
+            if not pr:
+                    return None
+            return {
+                    "number": pr.get("number"),
+                    "title": pr.get("title"),
+                    "url": pr.get("url"),
+                    "description": pr.get("body") or "",
+                    "merged": pr.get("merged"),
+                    "mergedAt": pr.get("mergedAt"),
+            }
+
     async def search_codebase(
         self,
         repo: str,
@@ -748,3 +993,48 @@ class GitHubClient:
                 byte_size=byte_size,
                 snippet=snippet,
             )
+
+    async def list_repository_files(
+        self,
+        repo: str,
+        ref: str | None = None,
+    ) -> List[str]:
+        """Return a list of all file paths (blobs) in the repository at the given ref.
+
+        Uses the Git Trees REST API:
+            1. Resolve default branch if ref not supplied.
+            2. GET /repos/{owner}/{repo}/git/trees/{ref}?recursive=1
+
+        Args:
+            repo: Repository in the form "owner/name".
+            ref: Branch / tag / commit SHA (defaults to default branch if omitted).
+
+        Returns:
+            A list of file paths (strings). If the underlying tree response is truncated
+            (very large repo), all paths returned by GitHub are included, and a warning is logged.
+        """
+        owner, name = self._split_repo(repo)
+        headers = dict(self.headers)
+        api_base = "https://api.github.com"
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            if not ref:
+                repo_resp = await client.get(f"{api_base}/repos/{owner}/{name}", headers=headers)
+                repo_resp.raise_for_status()
+                ref = repo_resp.json().get("default_branch") or "main"
+
+            tree_resp = await client.get(
+                f"{api_base}/repos/{owner}/{name}/git/trees/{ref}",
+                params={"recursive": 1},
+                headers=headers,
+            )
+            tree_resp.raise_for_status()
+            tree_json = tree_resp.json()
+            truncated = bool(tree_json.get("truncated"))
+            paths: List[str] = [e.get("path") for e in tree_json.get("tree", []) if e.get("type") == "blob" and e.get("path")]
+            if truncated:
+                logging.warning(
+                    "Tree listing truncated for %s (ref=%s); results may be incomplete.",
+                    repo,
+                    ref,
+                )
+            return paths

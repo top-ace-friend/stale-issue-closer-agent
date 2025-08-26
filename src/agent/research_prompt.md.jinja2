@@ -12,15 +12,19 @@ Your summary MUST include sections with these headings (if info exists):
 - Open Questions
 
 Tool usage rules:
-- Available tools: search_issues, get_issue, search_code, fetch_file.
+- Available tools: search_issues, search_pull_requests, get_issue, get_pull_request, search_code, fetch_file, list_repository_files.
 - Max total tool calls: 8. Hard stop after that and summarize.
 - Each individual tool: at most 3 calls.
 - NEVER call get_issue for the primary issue (already provided).
 - Only call get_issue for related issue numbers you explicitly discover.
+- Use search_pull_requests to locate related PRs by keyword; use get_pull_request for a specific PR number if you see a PR number referenced in another response and need to inspect its merged status or description.
+- list_repository_files: Call at most ONCE and ONLY if you truly need to confirm the presence or absence of files (e.g., to see if an example, config, or module exists). Do NOT echo the full file list—just cite specific relevant paths you reference.
+- Prefer targeted search_code before listing all files. If search_code already surfaces relevant paths, skip list_repository_files.
+- fetch_file: Only fetch a file's contents if you need concrete details from it (limit to the minimal set).
 - When you have enough info, output the summary directly with NO further tool calls.
 - The FINAL assistant message (your summary) must NOT contain tool calls.
-Coding search guidance: search_code queries must be simple keywords or phrases (no AND/OR/NOT).
-If you risk exceeding limits, stop and summarize with what you have.
+Coding search guidance: search_code queries must be simple keywords or phrases (no AND/OR/NOT). Use separate calls for different distinct keywords if needed.
+If you risk exceeding limits, or further calls would be redundant, stop and summarize with what you have.
 
 Issue details provided as context (do not fetch again):
 - number: {{ issue.number }}
@@ -28,9 +32,15 @@ Issue details provided as context (do not fetch again):
 - url: {{ issue.url }}
 - updatedAt: {{ issue.updated_at }}
 - labels: {{ issue.labels|join(', ') if issue.labels else '(none)' }}
-- body (truncated to 3000 chars):
-{{ issue.body[:3000] }}
-- comments ({{ issue.comments|length }} total JSON):
-{{ comments_json }}
+- body:
+{{ issue.body }}
+- comments ({{ issue.comments|length }} total):
+{% if issue.comments %}
+{% for c in issue.comments %}
+	- {{ c.author or 'unknown' }} ({{ c.createdAt }}): {{ (c.body or '').replace('\\n', ' ') }}
+{% endfor %}
+{% else %}
+	(none)
+{% endif %}
 
 Remember: DO NOT decide closure; just research.
