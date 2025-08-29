@@ -5,11 +5,9 @@ URL: {{ url }}
 ## Proposed Actions
 
 {% for a in actions %}
-- **{{ a.name }}**: {% if a.value is sameas true %}✅ {% endif %}{{ a.value }}
-	{% if a.rationale %}
-	- Rationale:
-		{{ a.rationale | replace('\n', '\n    ') }}
-	{% endif %}
+- **{{ a.name }}**: {% if a.value is sameas true %}✅ {% endif %}{% if a.value is iterable and a.value is not string %}{{ a.value | join(', ') if a.value else 'None' }}{% else %}{{ a.value }}{% endif %}{% if a.rationale %}  
+	Rationale: {{ a.rationale | replace('\n', '\n  ') }}{% endif %}
+
 {% endfor %}
 
 ### Overall Rationale

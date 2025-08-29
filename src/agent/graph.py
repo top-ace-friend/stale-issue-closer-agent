@@ -46,8 +46,35 @@ load_dotenv(override=True)
 
 logger = logging.getLogger(__name__)
 
+
 # Jinja2 environment shared by all templates
 _jinja_env = Environment(loader=BaseLoader(), autoescape=False, trim_blocks=True, lstrip_blocks=True)
+
+# Singleton GitHub client (lazy-init) to reuse label cache and HTTP configuration
+_GH_CLIENT: GitHubClient | None = None
+
+def get_client() -> GitHubClient:
+    global _GH_CLIENT
+    if _GH_CLIENT is None:
+        _GH_CLIENT = GitHubClient()
+    return _GH_CLIENT
+
+# Helper to fetch labels via a shared client instance (no module-level cache needed now)
+async def _get_repository_labels() -> dict[str, dict[str, str]]:
+    client = get_client()
+    try:
+        labels = await client.get_repository_labels(TARGET_REPO)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Failed fetching repository labels for %s: %s", TARGET_REPO, exc)
+        return {}
+    return {
+        (lbl.get("name") or ""): {
+            "description": (lbl.get("description") or "").strip(),
+            "color": (lbl.get("color") or "").strip(),
+        }
+        for lbl in labels if lbl.get("name")
+    }
+
 
 # Review description template for human interrupt (required, Jinja2)
 REVIEW_TEMPLATE_PATH = Path(__file__).with_name("review_template.md.jinja2")
@@ -81,12 +108,16 @@ class ProposalModel(BaseModel):
     # with State.issue. This model focuses solely on recommended maintenance actions.
     close_issue: bool = Field(description="Whether the issue should be closed now")
     close_issue_rationale: str | None = Field(default=None, description="Specific justification (evidence) for closing or leaving open; cite signals.")
-    remove_label_for_stale: bool = Field(description="Whether to remove the 'Stale' label (issue should remain open or has recent activity)")
-    remove_label_for_stale_rationale: str | None = Field(default=None, description="Why the stale label should be removed or kept.")
-    add_label_for_enhancement: bool = Field(description="Whether to add the 'enhancement' label")
-    add_label_for_enhancement_rationale: str | None = Field(default=None, description="Evidence that this is (or is not) an enhancement request.")
-    add_label_for_needs_more_info: bool = Field(description="Whether to add the 'needs more info' label (request clarification/details)")
-    add_label_for_needs_more_info_rationale: str | None = Field(default=None, description="Why additional info is required or not necessary.")
+    add_labels: list[str] = Field(
+        default_factory=list,
+        description="Labels to add (must be existing repository labels; see provided label list with descriptions).",
+    )
+    add_labels_rationale: str | None = Field(default=None, description="Justification for each label added; cite signals.")
+    remove_labels: list[str] = Field(
+        default_factory=list,
+        description="Labels to remove (must be existing repository labels).",
+    )
+    remove_labels_rationale: str | None = Field(default=None, description="Justification for each label removed; cite signals or conflicts.")
     assign_issue_to_copilot: bool = Field(description="Whether to assign the issue to the Copilot agent because it appears trivial with an easy / well-bounded fix")
     assign_issue_to_copilot_rationale: str | None = Field(default=None, description="Evidence that the issue is trivial and suitable for automated Copilot agent fix, or why not.")
     post_comment: str | None = Field(
@@ -139,20 +170,29 @@ def _build_llm() -> Any:
 
 
 @tool("search_issues")
-async def tool_search_issues(query: str) -> str:
-    """Search issues in the target repo.
+async def tool_search_issues(query: str, config: RunnableConfig) -> str:  # type: ignore[override]
+    """Search issues in the target repo, optionally filtering the active issue.
+
+    Context management: If the invoking runnable passes a configurable value
+    `active_issue_number` via the `RunnableConfig` (config["configurable"]["active_issue_number"]) then
+    that issue will be excluded from the returned list. This avoids self-referential
+    results during research.
 
     Args:
         query: Free-text and/or qualifiers. The repo qualifier is added automatically.
+        config: Runtime config (used here only for optional filtering).
 
     Returns:
-        JSON string containing a list of issue dicts with id, number, title, url, state,
-        updatedAt, createdAt, author, labels, body, and optionally comments.
+        JSON array of issue dicts.
     """
-    client = GitHubClient()
-    items = await client.search_issues_with_bodies(
-        TARGET_REPO, query_text=query, max_results=5, include_comments=True
+    client = get_client()
+    # Over-fetch by 1 so that if the active issue appears we can still return up to 5 others.
+    raw_items = await client.search_issues_with_bodies(
+        TARGET_REPO, query_text=query, max_results=6, include_comments=True
     )
+    active_issue_number = (config or {}).get("configurable", {}).get("active_issue_number")
+    filtered = [it for it in raw_items if it.get("number") != active_issue_number]
+    items = filtered[:5]
     return json.dumps(items)
 
 
@@ -174,7 +214,7 @@ async def tool_search_code(query: str) -> str:
     Returns:
         JSON string containing a list of code hit dicts with repository, path, is_binary, byte_size, and optionally text.
     """
-    client = GitHubClient()
+    client = get_client()
     hits = await client.search_codebase(
         TARGET_REPO, query_text=query, max_results=10, include_text=False
     )
@@ -196,7 +236,7 @@ async def tool_search_pull_requests(query: str) -> str:
     JSON list of pull request objects (up to 5). Each contains: id, number, title, url,
     body (description), merged (bool), mergedAt, createdAt, updatedAt.
     """
-    client = GitHubClient()
+    client = get_client()
     pulls = await client.search_pull_requests(
     TARGET_REPO, query_text=query, max_results=5
     )
@@ -212,7 +252,7 @@ async def tool_fetch_file(filename_or_path: str) -> str:
     Returns:
         JSON string containing the file contents or metadata.
     """
-    client = GitHubClient()
+    client = get_client()
     item = await client.fetch_file(TARGET_REPO, filename_or_path, include_text=True)
     return json.dumps(item.__dict__ if item else {})
 
@@ -227,7 +267,7 @@ async def tool_get_issue(issue_number: int) -> str:
         JSON string with issue fields (id, number, title, url, state, updatedAt, createdAt, author, labels, body, comments[]).
         Returns an empty JSON object if the issue is not found.
     """
-    client = GitHubClient()
+    client = get_client()
     issue = await client.get_issue(TARGET_REPO, issue_number, include_comments=True, comments_limit=50)
     return json.dumps(issue or {})
 
@@ -238,7 +278,7 @@ async def tool_get_pull_request(pr_number: int) -> str:
     Returns JSON with: number, title, url, description, merged, mergedAt.
     Empty JSON object if not found.
     """
-    client = GitHubClient()
+    client = get_client()
     try:
         pr = await client.get_pull_request(TARGET_REPO, pr_number)
     except Exception as exc:  # noqa: BLE001
@@ -255,7 +295,7 @@ async def tool_list_repository_files(ref: str | None = None) -> str:
     Returns:
         JSON array of file path strings. May be incomplete for very large repos (tree truncation).
     """
-    client = GitHubClient()
+    client = get_client()
     paths = await client.list_repository_files(TARGET_REPO, ref=ref)
     return json.dumps(paths)
 
@@ -325,7 +365,13 @@ async def research_issue_node(state: State, config: RunnableConfig) -> dict[str,
     except ValueError:
         rec_limit = 20
     # Merge provided config with our recursion limit (without mutating original)
-    merged_config: RunnableConfig = {**(config or {}), "configurable": {**getattr(config, "get", lambda _k, _d=None: {})("configurable", {}), "recursion_limit": rec_limit}}  # type: ignore[arg-type]
+    merged_config: RunnableConfig = {
+        **(config or {}),
+        "configurable": {
+            "recursion_limit": rec_limit,
+            "active_issue_number": issue["number"],
+        },
+    }
 
     try:
         result = await agent.ainvoke({"messages": [("human", prompt)]}, config=merged_config)
@@ -367,9 +413,13 @@ async def propose_action_node(state: State, config: RunnableConfig) -> dict[str,
     structured = model.with_structured_output(ProposalModel)
     # Provide only the distilled research to minimize tokens
     # Always fetch the authenticated viewer login via GitHub API (no env var usage)
-    gh = GitHubClient()
+    gh = get_client()
     maintainer_username = await gh.get_viewer_login()
-    system_prompt = PROPOSE_ACTION_PROMPT_TEMPLATE_JINJA.render(maintainer_username=maintainer_username)
+    label_meta = await _get_repository_labels()
+    system_prompt = PROPOSE_ACTION_PROMPT_TEMPLATE_JINJA.render(
+        maintainer_username=maintainer_username,
+        repo_labels=[{"name": n, "description": meta.get("description", "")} for n, meta in sorted(label_meta.items())],
+    )
     user_content = (
         f"Issue number: {issue['number']}\n"
         f"Title: {issue['title']}\n"
@@ -397,24 +447,21 @@ async def review_issue_node(state: State, config: RunnableConfig) -> dict[str, A
     title = issue_identity.get("title")
     url = issue_identity.get("url")
     close_issue = proposal_actions.get("close_issue")
-    remove_label_for_stale = proposal_actions.get("remove_label_for_stale")
-    add_label_for_enhancement = proposal_actions.get("add_label_for_enhancement")
-    add_label_for_needs_more_info = proposal_actions.get("add_label_for_needs_more_info")
+    add_labels = proposal_actions.get("add_labels") or []
+    remove_labels = proposal_actions.get("remove_labels") or []
     post_comment = proposal_actions.get("post_comment")
     rationale = proposal_actions.get("rationale")
     close_issue_rationale = proposal_actions.get("close_issue_rationale")
-    remove_label_for_stale_rationale = proposal_actions.get("remove_label_for_stale_rationale")
-    add_label_for_enhancement_rationale = proposal_actions.get("add_label_for_enhancement_rationale")
-    add_label_for_needs_more_info_rationale = proposal_actions.get("add_label_for_needs_more_info_rationale")
+    add_labels_rationale = proposal_actions.get("add_labels_rationale")
+    remove_labels_rationale = proposal_actions.get("remove_labels_rationale")
     assign_issue_to_copilot = proposal_actions.get("assign_issue_to_copilot")
     assign_issue_to_copilot_rationale = proposal_actions.get("assign_issue_to_copilot_rationale")
 
     actions_for_template = [
         {"name": "close_issue", "value": close_issue, "rationale": close_issue_rationale},
-        {"name": "remove_label_for_stale", "value": remove_label_for_stale, "rationale": remove_label_for_stale_rationale},
-        {"name": "add_label_for_enhancement", "value": add_label_for_enhancement, "rationale": add_label_for_enhancement_rationale},
-        {"name": "add_label_for_needs_more_info", "value": add_label_for_needs_more_info, "rationale": add_label_for_needs_more_info_rationale},
-    {"name": "assign_issue_to_copilot", "value": assign_issue_to_copilot, "rationale": assign_issue_to_copilot_rationale},
+        {"name": "add_labels", "value": add_labels, "rationale": add_labels_rationale},
+        {"name": "remove_labels", "value": remove_labels, "rationale": remove_labels_rationale},
+        {"name": "assign_issue_to_copilot", "value": assign_issue_to_copilot, "rationale": assign_issue_to_copilot_rationale},
         {"name": "post_comment", "value": bool(post_comment), "rationale": (post_comment[:140] + "…") if post_comment and len(post_comment) > 140 else post_comment},
     ]
     description = REVIEW_TEMPLATE_JINJA.render(
@@ -430,9 +477,8 @@ async def review_issue_node(state: State, config: RunnableConfig) -> dict[str, A
         action=f"Review maintenance actions: {title}",
         args={
             "close_issue": close_issue,
-            "remove_label_for_stale": remove_label_for_stale,
-            "add_label_for_enhancement": add_label_for_enhancement,
-            "add_label_for_needs_more_info": add_label_for_needs_more_info,
+            "add_labels": add_labels,
+            "remove_labels": remove_labels,
             "assign_issue_to_copilot": assign_issue_to_copilot,
             "post_comment": post_comment,
         },
@@ -453,13 +499,12 @@ async def review_issue_node(state: State, config: RunnableConfig) -> dict[str, A
 
     # Prepare a decision record for this issue
     decision: dict[str, Any] = {
-        "number": number,  # authoritative source from state.issue
+        "number": number,
         "approved": False,
         "close_issue": bool(close_issue),
-        "remove_label_for_stale": bool(remove_label_for_stale),
-        "add_label_for_enhancement": bool(add_label_for_enhancement),
-        "add_label_for_needs_more_info": bool(add_label_for_needs_more_info),
-    "assign_issue_to_copilot": bool(assign_issue_to_copilot),
+        "add_labels": list(add_labels),
+        "remove_labels": list(remove_labels),
+        "assign_issue_to_copilot": bool(assign_issue_to_copilot),
         "post_comment": post_comment,
         "note": None,
     }
@@ -481,9 +526,8 @@ async def review_issue_node(state: State, config: RunnableConfig) -> dict[str, A
         decision.update({
             "approved": True,
             "close_issue": _coerce_bool(ar_args.get("close_issue", close_issue), close_issue),
-            "remove_label_for_stale": _coerce_bool(ar_args.get("remove_label_for_stale", remove_label_for_stale), remove_label_for_stale),
-            "add_label_for_enhancement": _coerce_bool(ar_args.get("add_label_for_enhancement", add_label_for_enhancement), add_label_for_enhancement),
-            "add_label_for_needs_more_info": _coerce_bool(ar_args.get("add_label_for_needs_more_info", add_label_for_needs_more_info), add_label_for_needs_more_info),
+            "add_labels": ar_args.get("add_labels", add_labels) or [],
+            "remove_labels": ar_args.get("remove_labels", remove_labels) or [],
             "assign_issue_to_copilot": _coerce_bool(ar_args.get("assign_issue_to_copilot", assign_issue_to_copilot), assign_issue_to_copilot),
             "post_comment": ar_args.get("post_comment", post_comment),
         })
@@ -511,35 +555,48 @@ async def apply_decision_node(state: State, config: RunnableConfig) -> dict[str,
 
     number = int(decision.get("number"))
     close_issue = bool(decision.get("close_issue"))
-    remove_label_for_stale = bool(decision.get("remove_label_for_stale"))
-    add_label_for_enhancement = bool(decision.get("add_label_for_enhancement"))
-    add_label_for_needs_more_info = bool(decision.get("add_label_for_needs_more_info"))
+    add_labels = decision.get("add_labels") or []
+    remove_labels = decision.get("remove_labels") or []
     assign_issue_to_copilot = bool(decision.get("assign_issue_to_copilot"))
     post_comment = (decision.get("post_comment") or "").strip() or None
 
-    client = GitHubClient()
+    client = get_client()
 
-    # 1. Remove stale label if requested
-    if remove_label_for_stale:
-        try:
-            await client.remove_label(TARGET_REPO, number, "Stale")
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Failed to remove Stale label on #%s: %s", number, exc)
+    label_meta = await _get_repository_labels()
+    allowed = set(label_meta.keys())
+    def _normalize_list(vals):
+        if not isinstance(vals, list):
+            return []
+        out: list[str] = []
+        for v in vals:
+            if not isinstance(v, str):
+                continue
+            v_clean = v.strip()
+            if not v_clean:
+                continue
+            if v_clean in allowed:
+                out.append(v_clean)
+            else:
+                logger.warning("Ignoring unsupported label '%s' (dynamic allowed list)", v)
+        return out
+    add_labels = _normalize_list(add_labels)
+    remove_labels = _normalize_list(remove_labels)
 
-    # 2. Add labels as requested (avoid duplicate logic if both accidentally true)
-    if add_label_for_enhancement and add_label_for_needs_more_info:
-        # Prefer needs more info (user action required) – drop enhancement in this conflict.
-        add_label_for_enhancement = False
-    if add_label_for_enhancement:
+    # Remove labels first
+    for label in remove_labels:
         try:
-            await client.add_label(TARGET_REPO, number, "enhancement")
+            await client.remove_label(TARGET_REPO, number, label)
         except Exception as exc:  # noqa: BLE001
-            logger.warning("Failed to add enhancement label to #%s: %s", number, exc)
-    if add_label_for_needs_more_info:
+            logger.warning("Failed to remove label '%s' on #%s: %s", label, number, exc)
+
+    # Add labels (skip any that were also in remove list to avoid churn)
+    for label in add_labels:
+        if label in remove_labels:
+            continue
         try:
-            await client.add_label(TARGET_REPO, number, "needs more info")
+            await client.add_label(TARGET_REPO, number, label)
         except Exception as exc:  # noqa: BLE001
-            logger.warning("Failed to add needs more info label to #%s: %s", number, exc)
+            logger.warning("Failed to add label '%s' to #%s: %s", label, number, exc)
 
     # 3. Post comment if provided
     if post_comment:

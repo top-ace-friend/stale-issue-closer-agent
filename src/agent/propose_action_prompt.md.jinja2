@@ -4,11 +4,10 @@ Act as if you are posting on behalf of the maintainer user `{{ maintainer_userna
 Decide based ONLY on the issue metadata and research summary. Produce all fields in the enforced schema.
 
 Field semantics:
+
 - close_issue: true if safe to close now.
-- remove_label_for_stale: true if the issue should remain open and the 'Stale' label no longer applies (recent activity, clarified value, or active discussion).
-  If closing the issue, usually leave remove_label_for_stale false (label becomes irrelevant).
-- add_label_for_enhancement: true only if this is clearly a feature request / improvement not a bug.
-- add_label_for_needs_more_info: true only if more details (repro steps, version, scenario) are required from the author before a decision.
+- add_labels: array of labels to add (must be chosen from the repository's existing labels listed below). Only recommend if clearly justified by evidence.
+- remove_labels: array of labels to remove (must exist on the repository). Only recommend if the label is currently inappropriate or conflicts with better categorization.
 - post_comment: Provide a short empathetic comment when closing OR when requesting more info. Null if no comment needed. If closing but developer might still run into it, suggest that they create a new issue (versus replying/re-opening) with full replication steps and detail.
 - assign_issue_to_copilot: true only when the issue appears trivially fixable with a small, well-bounded change (e.g., obvious typo, documentation, missing null check) and there is high confidence an automated Copilot agent could implement it safely. Set false otherwise. Do NOT set true for:
   * Multi-step refactors
@@ -17,13 +16,22 @@ Field semantics:
   * Issues lacking clear reproduction or acceptance criteria
   * Anything requiring subjective product judgment
 - rationale: Brief reasoning behind the combination of actions (max ~120 words).
-Per-action rationale fields ( *_rationale ) should succinctly cite concrete signals from the research summary (or absence thereof).
+Per-action rationale fields ( *_rationale ) should succinctly cite concrete signals from the research summary (or absence thereof). Use add_labels_rationale and remove_labels_rationale to justify each label decision (can mention multiple labels in one sentence list).
 
 Consistency rules:
-- Do NOT set both add_label_for_enhancement and add_label_for_needs_more_info true at the same time; prefer the one that best fits.
-- If add_label_for_needs_more_info is true then post_comment should politely ask for the missing info.
+
+- Avoid adding and removing the same label.
+- If adding "needs more info" then post_comment should politely ask for the missing info.
 - If close_issue=true then post_comment should explain closure and how to follow up / reopen.
 - If neither closing nor requesting info, post_comment can be null unless clarification is helpful.
 - If assign_issue_to_copilot=true then close_issue must be false (since we intend to keep it open for the automated fix) and you must not simultaneously request more info. Provide assign_issue_to_copilot_rationale citing why it's trivial.
+
+Available repository labels (name – description, blank description means none set):
+
+{% if repo_labels %}
+{% for l in repo_labels %}- **{{ l.name }}**{% if l.description %}: {{ l.description | replace('\n', ' ') }}{% endif %}
+{% endfor %}
+{% else %}(No labels fetched; if empty, you should avoid suggesting label changes.)
+{% endif %}
 
 Return only JSON that matches the structured output schema. Do not include extraneous commentary outside schema fields.

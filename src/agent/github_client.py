@@ -97,6 +97,18 @@ class GitHubClient:
         }
         self.timeout = httpx.Timeout(timeout)
         self._viewer_login: str | None = None  # cache for authenticated user login
+        self._repo_labels_cache: dict[str, list[Dict[str, Any]]] = {}
+
+    async def get_repository_labels(self, repo: str, force_refresh: bool = False) -> list[Dict[str, Any]]:
+        """Return cached repository labels (list of dicts) for repo.
+
+        Caches per-repo list on first fetch. Set force_refresh=True to refetch.
+        """
+        if not force_refresh and repo in self._repo_labels_cache:
+            return self._repo_labels_cache[repo]
+        labels = await self.list_repository_labels(repo)
+        self._repo_labels_cache[repo] = labels
+        return labels
 
     async def get_viewer_login(self) -> str:
         """Return the login of the authenticated user (GitHub token owner).
@@ -1038,3 +1050,49 @@ class GitHubClient:
                     ref,
                 )
             return paths
+
+    async def list_repository_labels(
+        self,
+        repo: str,
+        page_size: int = 50,
+        max_labels: int | None = None,
+    ) -> List[Dict[str, Any]]:
+        """List all labels for a repository using the REST endpoint.
+
+        Endpoint: GET /repos/{owner}/{repo}/labels (paginated via Link headers).
+
+        Args:
+            repo: Repository full name ("owner/name").
+            page_size: Page size per request (max 100 per GitHub docs; enforced here).
+            max_labels: Optional cap on total labels returned; fetches all when None.
+
+        Returns:
+            List of dicts: {name, description, color}.
+        """
+        owner, name = self._split_repo(repo)
+        per_page = min(100, max(1, page_size))
+        page = 1
+        labels: List[Dict[str, Any]] = []
+        base_url = f"https://api.github.com/repos/{owner}/{name}/labels"
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            while True:
+                params = {"per_page": per_page, "page": page}
+                resp = await client.get(base_url, headers=self.headers, params=params)
+                resp.raise_for_status()
+                batch = resp.json()
+                if not isinstance(batch, list):
+                    break
+                for item in batch:
+                    labels.append({
+                        "name": item.get("name"),
+                        "description": (item.get("description") or "").strip(),
+                        "color": item.get("color") or "",
+                    })
+                    if max_labels is not None and len(labels) >= max_labels:
+                        return labels
+                # Pagination: check Link header for rel="next"
+                link_header = resp.headers.get("Link") or ""
+                if 'rel="next"' not in link_header:
+                    break
+                page += 1
+        return labels
