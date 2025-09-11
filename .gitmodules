@@ -1,0 +1,4 @@
+[submodule "agent-inbox"]
+	path = agent-inbox
+	url = https://github.com/langchain-ai/agent-inbox.git
+	branch = ui-improve
