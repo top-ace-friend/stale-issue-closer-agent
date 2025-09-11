@@ -54,6 +54,11 @@ _jinja_env = Environment(loader=BaseLoader(), autoescape=False, trim_blocks=True
 _GH_CLIENT: GitHubClient | None = None
 
 def get_client() -> GitHubClient:
+    """Return a singleton `GitHubClient` instance.
+
+    Lazily constructs the client so that environment variables (like GITHUB_TOKEN)
+    are already loaded and we reuse label caches / HTTP configuration across tool calls.
+    """
     global _GH_CLIENT
     if _GH_CLIENT is None:
         _GH_CLIENT = GitHubClient()

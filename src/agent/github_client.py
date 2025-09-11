@@ -426,7 +426,7 @@ class GitHubClient:
         owner, name = self._split_repo(repo)
         # Fetch label id or create it
         label_query = """
-            query($owner: String!, $name: String!, $label: String!) {
+            query($owner: String!, $name: String!, $label: String!, $number: Int!) {
                 repository(owner: $owner, name: $name) {
                     label(name: $label) { id name }
                     issue(number: $number) { id }

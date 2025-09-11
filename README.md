@@ -3,7 +3,7 @@
 [![Open in GitHub Codespaces](https://img.shields.io/static/v1?style=for-the-badge&label=GitHub+Codespaces&message=Open&color=brightgreen&logo=github)](https://codespaces.new/top-ace-friend/stale-issue-closer-agent)
 [![Open in Dev Containers](https://img.shields.io/static/v1?style=for-the-badge&label=Dev%20Containers&message=Open&color=blue&logo=visualstudiocode)](https://vscode.dev/redirect?url=vscode://ms-vscode-remote.remote-containers/cloneInVolume?url=https://github.com/top-ace-friend/stale-issue-closer-agent)
 
-This repository provides a LangGraph-based agent that proposes closing stale GitHub issues, with a human-in-the-loop review step using Agent Inbox. It selects stale issues from a target repository, investigates with repository-aware tools, and then interrupts for you to approve, edit, respond, or ignore before it posts a closing comment and closes the issue. The agent uses Azure OpenAI for the LLM.
+This repository provides a LangGraph-based agentic system that proposes closing stale GitHub issues, with a human-in-the-loop review step using Agent Inbox. It selects stale issues from a target repository, investigates with repository-aware tools, and then interrupts for you to approve, edit, respond, or ignore before it posts a closing comment and closes the issue. The agent uses Azure OpenAI for the LLM.
 
 - Graph ID: `agent` (see `langgraph.json`)
 - Default target repo: `Azure-samples/azure-search-openai-demo` (configurable via `TARGET_REPO`)
