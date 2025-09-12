@@ -23,13 +23,14 @@ from typing import Any
 import azure.identity
 from dotenv import load_dotenv
 from jinja2 import BaseLoader, Environment
-from langchain_core.messages import AIMessage
+from langchain.agents import create_agent
+from langchain_core.messages import AIMessage, HumanMessage
+from langchain.agents.middleware import AgentMiddleware, AgentState, ModelRequest
 from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import tool
 from langchain_openai import AzureChatOpenAI, ChatOpenAI
 from langgraph.errors import GraphRecursionError
 from langgraph.graph import StateGraph
-from langgraph.prebuilt import create_react_agent
 from langgraph.prebuilt.interrupt import (
     ActionRequest,
     HumanInterrupt,
@@ -48,10 +49,13 @@ logger = logging.getLogger(__name__)
 
 
 # Jinja2 environment shared by all templates
-_jinja_env = Environment(loader=BaseLoader(), autoescape=False, trim_blocks=True, lstrip_blocks=True)
+_jinja_env = Environment(
+    loader=BaseLoader(), autoescape=False, trim_blocks=True, lstrip_blocks=True
+)
 
 # Singleton GitHub client (lazy-init) to reuse label cache and HTTP configuration
 _GH_CLIENT: GitHubClient | None = None
+
 
 def get_client() -> GitHubClient:
     """Return a singleton `GitHubClient` instance.
@@ -63,6 +67,7 @@ def get_client() -> GitHubClient:
     if _GH_CLIENT is None:
         _GH_CLIENT = GitHubClient()
     return _GH_CLIENT
+
 
 # Helper to fetch labels via a shared client instance (no module-level cache needed now)
 async def _get_repository_labels() -> dict[str, dict[str, str]]:
@@ -77,7 +82,8 @@ async def _get_repository_labels() -> dict[str, dict[str, str]]:
             "description": (lbl.get("description") or "").strip(),
             "color": (lbl.get("color") or "").strip(),
         }
-        for lbl in labels if lbl.get("name")
+        for lbl in labels
+        if lbl.get("name")
     }
 
 
@@ -92,15 +98,24 @@ RESEARCH_PROMPT_TEMPLATE = RESEARCH_PROMPT_TEMPLATE_PATH.read_text(encoding="utf
 RESEARCH_PROMPT_TEMPLATE_JINJA = _jinja_env.from_string(RESEARCH_PROMPT_TEMPLATE)
 
 # Propose action system prompt template (Jinja2)
-PROPOSE_ACTION_PROMPT_TEMPLATE_PATH = Path(__file__).with_name("propose_action_prompt.md.jinja2")
-PROPOSE_ACTION_PROMPT_TEMPLATE = PROPOSE_ACTION_PROMPT_TEMPLATE_PATH.read_text(encoding="utf-8")
-PROPOSE_ACTION_PROMPT_TEMPLATE_JINJA = _jinja_env.from_string(PROPOSE_ACTION_PROMPT_TEMPLATE)
+PROPOSE_ACTION_PROMPT_TEMPLATE_PATH = Path(__file__).with_name(
+    "propose_action_prompt.md.jinja2"
+)
+PROPOSE_ACTION_PROMPT_TEMPLATE = PROPOSE_ACTION_PROMPT_TEMPLATE_PATH.read_text(
+    encoding="utf-8"
+)
+PROPOSE_ACTION_PROMPT_TEMPLATE_JINJA = _jinja_env.from_string(
+    PROPOSE_ACTION_PROMPT_TEMPLATE
+)
+
 
 @dataclass
 class State:
     """State for single-issue processing."""
 
-    issue: dict[str, Any] | None = None  # Selected issue details (number, title, body, etc.)
+    issue: dict[str, Any] | None = (
+        None  # Selected issue details (number, title, body, etc.)
+    )
     proposal: dict[str, Any] | None = None  # Single proposal
     decision: dict[str, Any] | None = None  # Decision for this issue
     review_note: str | None = None  # Optional note from human review
@@ -109,24 +124,39 @@ class State:
 
 class ProposalModel(BaseModel):
     """Structured proposal produced after research phase."""
+
     # Identity fields (number, title, url) are intentionally omitted to avoid duplication
     # with State.issue. This model focuses solely on recommended maintenance actions.
     close_issue: bool = Field(description="Whether the issue should be closed now")
-    close_issue_rationale: str | None = Field(default=None, description="Specific justification (evidence) for closing or leaving open; cite signals.")
+    close_issue_rationale: str | None = Field(
+        default=None,
+        description="Specific justification (evidence) for closing or leaving open; cite signals.",
+    )
     add_labels: list[str] = Field(
         default_factory=list,
         description="Labels to add (must be existing repository labels; see provided label list with descriptions).",
     )
-    add_labels_rationale: str | None = Field(default=None, description="Justification for each label added; cite signals.")
+    add_labels_rationale: str | None = Field(
+        default=None, description="Justification for each label added; cite signals."
+    )
     remove_labels: list[str] = Field(
         default_factory=list,
         description="Labels to remove (must be existing repository labels).",
     )
-    remove_labels_rationale: str | None = Field(default=None, description="Justification for each label removed; cite signals or conflicts.")
-    assign_issue_to_copilot: bool = Field(description="Whether to assign the issue to the Copilot agent because it appears trivial with an easy / well-bounded fix")
-    assign_issue_to_copilot_rationale: str | None = Field(default=None, description="Evidence that the issue is trivial and suitable for automated Copilot agent fix, or why not.")
+    remove_labels_rationale: str | None = Field(
+        default=None,
+        description="Justification for each label removed; cite signals or conflicts.",
+    )
+    assign_issue_to_copilot: bool = Field(
+        description="Whether to assign the issue to the Copilot agent because it appears trivial with an easy / well-bounded fix"
+    )
+    assign_issue_to_copilot_rationale: str | None = Field(
+        default=None,
+        description="Evidence that the issue is trivial and suitable for automated Copilot agent fix, or why not.",
+    )
     post_comment: str | None = Field(
-        default=None, description="Optional comment to post (explanatory or request for info)"
+        default=None,
+        description="Optional comment to post (explanatory or request for info)",
     )
     rationale: str = Field(description="Concise reasoning for the chosen actions")
 
@@ -152,7 +182,9 @@ def _build_llm() -> Any:
 
         # Otherwise, use Azure AD token provider via Azure Developer CLI credential
         token_provider = azure.identity.get_bearer_token_provider(
-            azure.identity.AzureDeveloperCliCredential(tenant_id=os.getenv("AZURE_TENANT_ID")),
+            azure.identity.AzureDeveloperCliCredential(
+                tenant_id=os.getenv("AZURE_TENANT_ID")
+            ),
             "https://cognitiveservices.azure.com/.default",
         )
         return AzureChatOpenAI(
@@ -172,6 +204,33 @@ def _build_llm() -> Any:
         base_url="https://models.inference.ai.azure.com",
         api_key=SecretStr(token),
     )
+
+
+class ToolCallLimitMiddleware(AgentMiddleware):
+    def __init__(self, limit) -> None:
+        super().__init__()
+        self.limit = limit
+
+    def modify_model_request(
+        self, request: ModelRequest, state: AgentState
+    ) -> ModelRequest:
+        tool_call_count = sum(
+            1
+            for msg in state["messages"]
+            if isinstance(msg, AIMessage) and msg.tool_calls
+        )
+        if tool_call_count >= self.limit:
+            logger.info(
+                "Tool call limit of %d reached, disabling further tool calls.",
+                self.limit,
+            )
+            request.tools = []
+            request.messages.append(
+                HumanMessage(
+                    content="No more tool calls can be made, now it's time to summarize your findings based off previous research."
+                )
+            )
+        return request
 
 
 @tool("search_issues")
@@ -195,7 +254,9 @@ async def tool_search_issues(query: str, config: RunnableConfig) -> str:  # type
     raw_items = await client.search_issues_with_bodies(
         TARGET_REPO, query_text=query, max_results=6, include_comments=True
     )
-    active_issue_number = (config or {}).get("configurable", {}).get("active_issue_number")
+    active_issue_number = (
+        (config or {}).get("configurable", {}).get("active_issue_number")
+    )
     filtered = [it for it in raw_items if it.get("number") != active_issue_number]
     items = filtered[:5]
     return json.dumps(items)
@@ -225,6 +286,7 @@ async def tool_search_code(query: str) -> str:
     )
     return json.dumps([h.__dict__ for h in hits])
 
+
 @tool("search_pull_requests")
 async def tool_search_pull_requests(query: str) -> str:
     """Search pull requests in the target repo.
@@ -243,9 +305,10 @@ async def tool_search_pull_requests(query: str) -> str:
     """
     client = get_client()
     pulls = await client.search_pull_requests(
-    TARGET_REPO, query_text=query, max_results=5
+        TARGET_REPO, query_text=query, max_results=5
     )
     return json.dumps(pulls)
+
 
 @tool("fetch_file")
 async def tool_fetch_file(filename_or_path: str) -> str:
@@ -261,6 +324,7 @@ async def tool_fetch_file(filename_or_path: str) -> str:
     item = await client.fetch_file(TARGET_REPO, filename_or_path, include_text=True)
     return json.dumps(item.__dict__ if item else {})
 
+
 @tool("get_issue")
 async def tool_get_issue(issue_number: int) -> str:
     """Fetch a single issue (and recent comments) by its number.
@@ -273,8 +337,11 @@ async def tool_get_issue(issue_number: int) -> str:
         Returns an empty JSON object if the issue is not found.
     """
     client = get_client()
-    issue = await client.get_issue(TARGET_REPO, issue_number, include_comments=True, comments_limit=50)
+    issue = await client.get_issue(
+        TARGET_REPO, issue_number, include_comments=True, comments_limit=50
+    )
     return json.dumps(issue or {})
+
 
 @tool("get_pull_request")
 async def tool_get_pull_request(pr_number: int) -> str:
@@ -289,6 +356,7 @@ async def tool_get_pull_request(pr_number: int) -> str:
     except Exception as exc:  # noqa: BLE001
         return json.dumps({"error": str(exc)})
     return json.dumps(pr or {})
+
 
 @tool("list_repository_files")
 async def tool_list_repository_files(ref: str | None = None) -> str:
@@ -305,7 +373,9 @@ async def tool_list_repository_files(ref: str | None = None) -> str:
     return json.dumps(paths)
 
 
-async def select_stale_issue_node(state: State, config: RunnableConfig) -> dict[str, Any]:
+async def select_stale_issue_node(
+    state: State, config: RunnableConfig
+) -> dict[str, Any]:
     """Fetch stale issues and pick one (currently first in list) and its comments.
 
     Returns partial state with `issue` containing the selected issue, plus embedded comments list.
@@ -339,16 +409,19 @@ async def research_issue_node(state: State, config: RunnableConfig) -> dict[str,
     assert state.issue is not None, "Issue must be selected before research."
     issue = state.issue
     model = _build_llm()
-    research_tools = [
-        tool_search_issues,
-        tool_search_code,
-        tool_search_pull_requests,
-        tool_get_pull_request,
-        tool_fetch_file,
-        tool_get_issue,
-        tool_list_repository_files,
-    ]
-    agent = create_react_agent(model, research_tools)
+    agent = create_agent(
+        model,
+        tools=[
+            tool_search_issues,
+            tool_search_code,
+            tool_search_pull_requests,
+            tool_get_pull_request,
+            tool_fetch_file,
+            tool_get_issue,
+            tool_list_repository_files,
+        ],
+        middleware=[ToolCallLimitMiddleware(limit=10)],
+    )
     all_comments = issue.get("comments", [])
     prompt = RESEARCH_PROMPT_TEMPLATE_JINJA.render(
         repo=TARGET_REPO,
@@ -364,34 +437,17 @@ async def research_issue_node(state: State, config: RunnableConfig) -> dict[str,
         comments_json=json.dumps(all_comments, ensure_ascii=False),
     )
 
-    # Allow caller or env to override recursion limit (default 20)
-    try:
-        rec_limit = int(os.getenv("RESEARCH_RECURSION_LIMIT", "20"))
-    except ValueError:
-        rec_limit = 20
     # Merge provided config with our recursion limit (without mutating original)
     merged_config: RunnableConfig = {
         **(config or {}),
         "configurable": {
-            "recursion_limit": rec_limit,
             "active_issue_number": issue["number"],
         },
     }
 
-    try:
-        result = await agent.ainvoke({"messages": [("human", prompt)]}, config=merged_config)
-    except GraphRecursionError:
-        logger.warning("Research agent hit recursion limit (%s). Falling back to minimal summary.", rec_limit)
-        fallback = (
-            "Research phase exceeded recursion limit before converging. Proceeding with available static context.\n\n"
-            "Key Facts:\n"
-            f"Issue #{issue['number']}: {issue['title']}\n"
-            f"Labels: {', '.join(issue['labels']) if issue.get('labels') else '(none)'}\n"
-            f"Last Updated: {issue['updated_at']}\n\n"
-            "Signals Against Closing:\n- Agent could not complete research automatically.\n\n"
-            "Open Questions:\n- Additional related issues or code references were not gathered due to recursion limit.\n"
-        )
-        return {"research_summary": fallback}
+    result = await agent.ainvoke(
+        {"messages": [("human", prompt)]}, config=merged_config
+    )
 
     messages = result.get("messages") or []
     # Find last AI message without tool calls (research summary)
@@ -401,7 +457,9 @@ async def research_issue_node(state: State, config: RunnableConfig) -> dict[str,
             if not summary:
                 continue
             return {"research_summary": summary}
-    raise RuntimeError("Failed to obtain research summary (no final AI message without tool calls).")
+    raise RuntimeError(
+        "Failed to obtain research summary (no final AI message without tool calls)."
+    )
 
 
 async def propose_action_node(state: State, config: RunnableConfig) -> dict[str, Any]:
@@ -410,7 +468,9 @@ async def propose_action_node(state: State, config: RunnableConfig) -> dict[str,
     Uses a second LLM call with structured output (Option 2 pattern from docs).
     """
     assert state.issue is not None, "Issue must be selected before proposal."
-    assert state.research_summary is not None, "Research summary required before proposal."
+    assert (
+        state.research_summary is not None
+    ), "Research summary required before proposal."
     issue = state.issue
     research_summary = state.research_summary
     model = _build_llm()
@@ -423,7 +483,10 @@ async def propose_action_node(state: State, config: RunnableConfig) -> dict[str,
     label_meta = await _get_repository_labels()
     system_prompt = PROPOSE_ACTION_PROMPT_TEMPLATE_JINJA.render(
         maintainer_username=maintainer_username,
-        repo_labels=[{"name": n, "description": meta.get("description", "")} for n, meta in sorted(label_meta.items())],
+        repo_labels=[
+            {"name": n, "description": meta.get("description", "")}
+            for n, meta in sorted(label_meta.items())
+        ],
     )
     user_content = (
         f"Issue number: {issue['number']}\n"
@@ -433,10 +496,12 @@ async def propose_action_node(state: State, config: RunnableConfig) -> dict[str,
         f"Labels: {', '.join(issue['labels']) if issue.get('labels') else '(none)'}\n\n"
         "Research summary:\n" + research_summary
     )
-    response: ProposalModel = structured.invoke([
-        ("system", system_prompt),
-        ("human", user_content),
-    ])
+    response: ProposalModel = structured.invoke(
+        [
+            ("system", system_prompt),
+            ("human", user_content),
+        ]
+    )
     proposal_dict = response.model_dump()
     return {"proposal": proposal_dict}
 
@@ -460,14 +525,34 @@ async def review_issue_node(state: State, config: RunnableConfig) -> dict[str, A
     add_labels_rationale = proposal_actions.get("add_labels_rationale")
     remove_labels_rationale = proposal_actions.get("remove_labels_rationale")
     assign_issue_to_copilot = proposal_actions.get("assign_issue_to_copilot")
-    assign_issue_to_copilot_rationale = proposal_actions.get("assign_issue_to_copilot_rationale")
+    assign_issue_to_copilot_rationale = proposal_actions.get(
+        "assign_issue_to_copilot_rationale"
+    )
 
     actions_for_template = [
-        {"name": "close_issue", "value": close_issue, "rationale": close_issue_rationale},
+        {
+            "name": "close_issue",
+            "value": close_issue,
+            "rationale": close_issue_rationale,
+        },
         {"name": "add_labels", "value": add_labels, "rationale": add_labels_rationale},
-        {"name": "remove_labels", "value": remove_labels, "rationale": remove_labels_rationale},
-        {"name": "assign_issue_to_copilot", "value": assign_issue_to_copilot, "rationale": assign_issue_to_copilot_rationale},
-        {"name": "post_comment", "value": bool(post_comment), "rationale": (post_comment[:140] + "…") if post_comment and len(post_comment) > 140 else post_comment},
+        {
+            "name": "remove_labels",
+            "value": remove_labels,
+            "rationale": remove_labels_rationale,
+        },
+        {
+            "name": "assign_issue_to_copilot",
+            "value": assign_issue_to_copilot,
+            "rationale": assign_issue_to_copilot_rationale,
+        },
+        {
+            "name": "post_comment",
+            "value": bool(post_comment),
+            "rationale": (post_comment[:140] + "…")
+            if post_comment and len(post_comment) > 140
+            else post_comment,
+        },
     ]
     description = REVIEW_TEMPLATE_JINJA.render(
         number=number,
@@ -522,20 +607,29 @@ async def review_issue_node(state: State, config: RunnableConfig) -> dict[str, A
             ar_args: dict[str, Any] = inner if isinstance(inner, dict) else {}
         else:
             ar_args = {}
+
         def _coerce_bool(val, default=False):
             if isinstance(val, bool):
                 return val
             if isinstance(val, str):
                 return val.lower() in ("true", "1", "yes")
             return default
-        decision.update({
-            "approved": True,
-            "close_issue": _coerce_bool(ar_args.get("close_issue", close_issue), close_issue),
-            "add_labels": ar_args.get("add_labels", add_labels) or [],
-            "remove_labels": ar_args.get("remove_labels", remove_labels) or [],
-            "assign_issue_to_copilot": _coerce_bool(ar_args.get("assign_issue_to_copilot", assign_issue_to_copilot), assign_issue_to_copilot),
-            "post_comment": ar_args.get("post_comment", post_comment),
-        })
+
+        decision.update(
+            {
+                "approved": True,
+                "close_issue": _coerce_bool(
+                    ar_args.get("close_issue", close_issue), close_issue
+                ),
+                "add_labels": ar_args.get("add_labels", add_labels) or [],
+                "remove_labels": ar_args.get("remove_labels", remove_labels) or [],
+                "assign_issue_to_copilot": _coerce_bool(
+                    ar_args.get("assign_issue_to_copilot", assign_issue_to_copilot),
+                    assign_issue_to_copilot,
+                ),
+                "post_comment": ar_args.get("post_comment", post_comment),
+            }
+        )
     elif rtype == "response":
         note = human_response.get("args")
         if isinstance(note, str):
@@ -569,6 +663,7 @@ async def apply_decision_node(state: State, config: RunnableConfig) -> dict[str,
 
     label_meta = await _get_repository_labels()
     allowed = set(label_meta.keys())
+
     def _normalize_list(vals):
         if not isinstance(vals, list):
             return []
@@ -582,8 +677,11 @@ async def apply_decision_node(state: State, config: RunnableConfig) -> dict[str,
             if v_clean in allowed:
                 out.append(v_clean)
             else:
-                logger.warning("Ignoring unsupported label '%s' (dynamic allowed list)", v)
+                logger.warning(
+                    "Ignoring unsupported label '%s' (dynamic allowed list)", v
+                )
         return out
+
     add_labels = _normalize_list(add_labels)
     remove_labels = _normalize_list(remove_labels)
 
