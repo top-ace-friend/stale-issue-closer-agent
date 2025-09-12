@@ -24,12 +24,11 @@ import azure.identity
 from dotenv import load_dotenv
 from jinja2 import BaseLoader, Environment
 from langchain.agents import create_agent
-from langchain_core.messages import AIMessage, HumanMessage
 from langchain.agents.middleware import AgentMiddleware, AgentState, ModelRequest
+from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import tool
 from langchain_openai import AzureChatOpenAI, ChatOpenAI
-from langgraph.errors import GraphRecursionError
 from langgraph.graph import StateGraph
 from langgraph.prebuilt.interrupt import (
     ActionRequest,
@@ -420,7 +419,7 @@ async def research_issue_node(state: State, config: RunnableConfig) -> dict[str,
             tool_get_issue,
             tool_list_repository_files,
         ],
-        middleware=[ToolCallLimitMiddleware(limit=10)],
+        middleware=[ToolCallLimitMiddleware(limit=4)],
     )
     all_comments = issue.get("comments", [])
     prompt = RESEARCH_PROMPT_TEMPLATE_JINJA.render(

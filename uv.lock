@@ -438,7 +438,7 @@ wheels = [
 
 [[package]]
 name = "langchain"
-version = "1.0.0a4"
+version = "1.0.0a5"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "langchain-core" },
@@ -446,9 +446,9 @@ dependencies = [
     { name = "langgraph" },
     { name = "pydantic" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/be/7e/5f1d34e4b34b271472cb864fd0367cc6f8b7d96f1f99abef4f3cb671ddf8/langchain-1.0.0a4.tar.gz", hash = "sha256:a21b567d3325ed9f3076a0916fc8d47b432b4071d02ae4a69862dddb66f2caf4", size = 100389 }
+sdist = { url = "https://files.pythonhosted.org/packages/5a/04/f0cb690d7d41c80c1596e004bb0c52833695ad6d5754190afe74bc56369c/langchain-1.0.0a5.tar.gz", hash = "sha256:4edc46cdafafc05ffadf007f4c83530e67f7f523203aa3f4dd903c9a1c199dc6", size = 100025 }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/e2/36/4df2db6de706e0d1ee3ad9a87f0868fc3c71c9ef6fa138aa8a30e482d6e4/langchain-1.0.0a4-py3-none-any.whl", hash = "sha256:749ceec4e308f2529329913397225967be26ece7d935d2b4ae0f70ee446aa2bc", size = 68718 },
+    { url = "https://files.pythonhosted.org/packages/38/aa/f53df9417bddeb3656b848ebb6f1c663cf76926ee58510c5dfe47984defe/langchain-1.0.0a5-py3-none-any.whl", hash = "sha256:7090599d4d4f502596853b45678309c19fd75353d40372dad6ca507da93a1da9", size = 68391 },
 ]
 
 [[package]]
@@ -1248,7 +1248,7 @@ requires-dist = [
     { name = "azure-identity", specifier = ">=1.24.0" },
     { name = "httpx", specifier = ">=0.27" },
     { name = "jinja2", specifier = ">=3.1.4" },
-    { name = "langchain", specifier = "==1.0.0a4" },
+    { name = "langchain", specifier = "==1.0.0a5" },
     { name = "langchain-openai", specifier = ">=0.3.30" },
     { name = "langgraph", specifier = ">=0.6.5" },
     { name = "langgraph-sdk", specifier = ">=0.2.2" },
